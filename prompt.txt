@@ -1,0 +1,2188 @@
+once done I want a factMCP client that works well with my factMCP backend which talks with Ollama using these .env vars:
+
+# MCP server (your tools server)
+MCP_URL=https://mcp-lightspeedbackend.onrender.com
+
+# Ollama (local daemon is default base URL)
+OLLAMA_BASE_URL=http://ollama.com
+OLLAMA_MODEL=deepseek-v3.1:671b-cloud
+
+# Only required if you call https://ollama.com/api directly
+OLLAMA_API_KEY=3b987dc5dc6e4dcab20093c1097718a8.v50nmatpJDVAM-U2qQBmjA96
+
+# Timeouts (ms)
+OLLAMA_TIMEOUT_MS=120000
+OLLAMA_FIRST_TOKEN_TIMEOUT_MS=20000
+
+API_KEY=5e7571d3a600120047e5ce906c1bdf08f72a95b8c4d37f75cfdf847b10f79c5a
+
+make it quick smart, a good assistant and capable of actually increasing sales and a good expierence overall.
+
+here is example code:"""
+client.py - Production-Ready Stateless Shopping Assistant for Render
+
+Hardened production deployment with proper error handling, security, and validation.
+Only recommends verified enabled products.
+
+Install dependencies:
+    pip install fastapi uvicorn[standard] httpx mcp python-dotenv pydantic
+
+Run locally:
+    python client.py
+
+Deploy to Render:
+    uvicorn client:app --host 0.0.0.0 --port $PORT
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import random
+from typing import Optional, List, Dict, Any, Set
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# Configuration
+PORT = int(os.getenv("PORT", "10000"))
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
+if not OLLAMA_BASE_URL:
+    raise ValueError("OLLAMA_BASE_URL is required")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.2"))
+MCP_URL = os.getenv("MCP_URL", "").strip()
+API_KEY = os.getenv("API_KEY", "")
+
+# System prompt that enforces variant-only recommendations
+SYSTEM_PROMPT = """
+You are a friendly, energetic co-shopper for our store. You keep it quick, clear, and helpful.
+
+PRIMARY GOAL
+Help the user complete their intent (find, choose, add to cart) with minimal back-and-forth.
+
+CRITICAL RULES (INTERNAL ONLY)
+1) You may ONLY recommend products from the ENABLED CATALOG provided.
+2) NEVER mention products not in the catalog.
+3) NEVER invent prices, availability, options, or details.
+4) You MUST internally use only VARIANT_KEYS from ALLOWED_VARIANTS.
+5) Any time you reference a specific purchasable item internally, you MUST include exactly one tag:
+   [V:productId:combinationId]
+6) These [V:productId:combinationId] tags are INTERNAL ONLY and will be removed before the user sees the response.
+7) NEVER say the word “variant”, “SKU”, “internal”, “rules”, “catalog”, or mention the tags to the user.
+8) If multiple in-stock options exist and the user hasn’t specified which one, ask ONE short clarification question.
+
+MOST IMPORTANT BEHAVIOR: STAY ON TRACK
+- If the user is in an “add to cart” flow, do NOT drift into new recommendations.
+- Once the user chooses an option (e.g., “the first one”, “grape”, “small”), you should:
+  (a) confirm that exact choice in one short line, and
+  (b) STOP. Do not suggest other products unless the user asks.
+
+INTENT MODES (follow these strictly)
+
+MODE A — ADD TO CART (highest priority)
+Trigger when the user says add/put/throw + cart/bag OR starts with “add …”.
+A1) If there is exactly ONE matching in-stock option, respond with ONLY:
+   - a short confirm line (friendly), and include ONE [V:...] line for that item.
+   No other products. No follow-up question.
+A2) If there are multiple in-stock options, respond with ONLY:
+   - a short question to pick one
+   - list ONLY the relevant options (max 4)
+   - each option must be its own line and MUST start with [V:...]
+   - ask for a simple selector: “Which one — 1 or 2?” (or flavor/size)
+A3) If user replies with a selector (“first one”, “#2”, “grape”, “small”):
+   - respond with ONLY the chosen item (one [V:...] line)
+   - and a short confirmation (“Got it — adding that.”)
+   No extra recommendations.
+A4) If you asked a yes/no about a specific option and the user affirms
+    (“yes”, “yeah”, “yup”, “ok”, “sure”, “sounds good”), treat it as choosing
+    that option and respond like A3 with the correct [V:...] line.
+If the user says “the first/second/third/last one”, you MUST choose exactly one item.
+Never claim you are adding something unless you will actually add it.
+Only add to cart when the USER has explicitly asked to add or confirmed a specific pending choice.
+
+MODE B — BROWSING / RECOMMENDATIONS
+Trigger when user is browsing (e.g., “show me chips”, “what snacks do you have”, “recommend me …”).
+B1) Recommend 2–3 items (max 4).
+B2) Each item must be:
+   - one bullet line starting with [V:...]
+   - “Name — Option/Label – $Price”
+   - followed by ONE short benefit on the next line
+B3) Ask at most ONE simple follow-up question (optional).
+B4) If user picks “first one”, treat it like MODE A3 (lock onto it).
+Do NOT add to cart unless the user explicitly asked. You may ask: “Want me to add one to your cart?”
+
+MODE C — UNKNOWN / NO MATCH
+If you can’t find a match in the catalog:
+- Say that you can’t find that exact item.
+- Ask ONE quick clarifying question or offer 2 close matches (MODE B rules).
+
+MODE D — CONVERSATION / CLARIFY
+Trigger when the user is chatting (hi/thanks/ok), asking meta questions, or giving instructions.
+- Respond normally in 1–2 short sentences.
+- Do NOT list products unless the user explicitly asked to browse OR you need a disambiguation for a cart action.
+
+FORMAT REQUIREMENTS (STRICT)
+- Any listed item MUST be on its own line.
+- Any listed item MUST start with exactly one [V:productId:combinationId] tag.
+- Do not output SKUs or any bracketed tokens besides [V:...].
+- Keep responses short: usually 1–6 lines.
+- No long intros. No “here’s everything”. No random add-ons.
+
+TONE
+- Friendly, energetic, relaxed.
+- Short sentences.
+- Not salesy.
+- Like a helpful friend shopping with them.
+
+EXAMPLES
+
+User: “add uncrustables to cart”
+Assistant:
+“Which one?”
+• [V:PID:CID] Smucker’s Uncrustables — Grape – $2.50
+  Classic PB&J vibe
+• [V:PID:CID] Smucker’s Uncrustables — Strawberry – $2.50
+  Sweeter, fruity fill
+“1 or 2?”
+
+User: “the first one”
+Assistant:
+“Got it — adding the grape one.”
+• [V:PID:CID] Smucker’s Uncrustables — Grape – $2.50
+  Classic PB&J vibe
+
+User: “What are some good snacks?”
+Assistant:
+“Here are a few popular picks:”
+• [V:PID:CID] Goldfish Crackers — Colors – $1.50
+  Fun, cheesy snack
+• [V:PID:CID] Core Power — Chocolate – $4.00
+  Great protein shake
+“Want me to add one to your cart?”
+
+User: “Add the second one to my cart.”
+Assistant:
+“Got it — adding the second one.”
+• [V:PID:CID] Core Power — Chocolate – $4.00
+
+"""
+
+SELECTION_SYSTEM_PROMPT = """
+You are a strict selection resolver.
+
+Your job: map a user's reply to one or more option indexes when possible.
+
+Rules:
+- Return ONLY valid JSON: {"indexes": [0, 2]}.
+- "indexes" is 0-based.
+- Return {"indexes": []} if you cannot confidently select any.
+- Use the assistant message and options list as your only choices.
+- If the user is confirming a specific option the assistant just asked about, select it.
+- If the user is asking a new question, changing the topic, or declining, return [].
+- Never invent options. Never include extra text.
+"""
+
+
+
+class MCPClient:
+    """Stateless MCP client for catalog access with proper lifecycle management."""
+    
+    def __init__(self):
+        self.catalog_cache: Optional[Dict[str, Any]] = None
+        self.cache_timestamp: float = 0
+        self.CACHE_TTL = 300  # 5 minutes
+        self.MCP_TIMEOUT_SEC = float(os.getenv("MCP_TIMEOUT_SEC", "12"))
+        self.MCP_MAX_RETRIES = int(os.getenv("MCP_MAX_RETRIES", "3"))
+        self.MCP_RETRY_BASE_SEC = float(os.getenv("MCP_RETRY_BASE_SEC", "0.4"))
+        self.MCP_BACKOFF_BASE_SEC = float(os.getenv("MCP_BACKOFF_BASE_SEC", "1.0"))
+        self.MCP_MAX_BACKOFF_SEC = float(os.getenv("MCP_MAX_BACKOFF_SEC", "60"))
+        self._catalog_lock = asyncio.Lock()
+        self._mcp_fail_count = 0
+        self._mcp_backoff_until = 0.0
+        self._last_backoff_log = 0.0
+        self._last_mcp_error = ""
+
+    def _mcp_in_backoff(self) -> bool:
+        return time.time() < self._mcp_backoff_until
+
+    def _register_mcp_failure(self, err: Exception | str):
+        self._mcp_fail_count = min(self._mcp_fail_count + 1, 10)
+        delay = self.MCP_BACKOFF_BASE_SEC * (2 ** (self._mcp_fail_count - 1))
+        delay = min(self.MCP_MAX_BACKOFF_SEC, delay)
+        self._mcp_backoff_until = time.time() + delay
+        self._last_mcp_error = str(err)
+
+    def _reset_mcp_backoff(self):
+        self._mcp_fail_count = 0
+        self._mcp_backoff_until = 0.0
+        self._last_mcp_error = ""
+        
+    async def initialize(self):
+        """No-op for HTTP tool calling."""
+        return
+
+    async def _call_tool_with_retry(self, tool_name: str, payload: Dict[str, Any]) -> Any:
+        """Call MCP HTTP tool endpoint with retries + backoff for resilience."""
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.MCP_MAX_RETRIES + 1):
+            try:
+                if self._mcp_in_backoff():
+                    raise RuntimeError("MCP backoff active")
+                if not MCP_URL:
+                    raise RuntimeError("MCP_URL not configured")
+                if not mcp_http_client:
+                    raise RuntimeError("MCP HTTP client not initialized")
+                url = f"{MCP_URL.rstrip('/')}/tools/{tool_name}"
+                resp = await mcp_http_client.post(url, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    f"MCP tool call failed ({tool_name}) attempt {attempt}/{self.MCP_MAX_RETRIES}: {e}"
+                )
+                if attempt < self.MCP_MAX_RETRIES:
+                    delay = self.MCP_RETRY_BASE_SEC * (2 ** (attempt - 1))
+                    delay += random.uniform(0, self.MCP_RETRY_BASE_SEC)
+                    await asyncio.sleep(delay)
+        if last_err:
+            self._register_mcp_failure(last_err)
+            raise last_err
+        raise RuntimeError("MCP tool call failed without exception")
+
+    @staticmethod
+    def _extract_tool_json(result: Any) -> Optional[Dict[str, Any]]:
+        if not result:
+            return None
+        if isinstance(result, dict):
+            return result
+        return None
+
+    async def _fetch_variants_for_product(self, product_id: int) -> List[Dict[str, Any]]:
+        if product_id <= 0:
+            return []
+        try:
+            result = await self._call_tool_with_retry(
+                "product_variants_get",
+                {"product_id": product_id}
+            )
+            data = self._extract_tool_json(result)
+            if not isinstance(data, dict):
+                return []
+            variants = data.get("variants", [])
+            if not isinstance(variants, list):
+                return []
+            normalized: List[Dict[str, Any]] = []
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                if not bool(variant.get("in_stock", True)):
+                    continue
+                raw_pid = variant.get("productId") or product_id
+                raw_cid = variant.get("combinationId")
+                if raw_cid is None:
+                    continue
+                try:
+                    pid = int(raw_pid)
+                    cid = int(raw_cid)
+                except (TypeError, ValueError):
+                    continue
+                normalized.append({
+                    "productId": pid,
+                    "combinationId": cid,
+                    "variantKey": make_variant_key(pid, cid),
+                    "effectiveSku": variant.get("effectiveSku") or "",
+                    "label": variant.get("label") or "",
+                    "price": float(variant.get("price", 0) or 0),
+                    "in_stock": True,
+                    "options": normalize_selected_options(variant.get("options")),
+                })
+            return normalized
+        except Exception as e:
+            logger.warning(f"Variant fetch failed for product {product_id}: {e}")
+            return []
+    
+    async def get_catalog(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Get enabled products from catalog with pagination support.
+        Uses cache to avoid hammering the MCP server.
+        """
+        # Check cache/backoff
+        if self._mcp_in_backoff():
+            now = time.time()
+            if now - self._last_backoff_log > 30:
+                logger.warning(
+                    f"MCP backoff active for {int(self._mcp_backoff_until - now)}s: {self._last_mcp_error}"
+                )
+                self._last_backoff_log = now
+            if self.catalog_cache:
+                logger.warning("Returning cached catalog due to MCP backoff")
+                return self.catalog_cache
+            return {"products": [], "total": 0, "variant_keys": set()}
+
+        # Check cache
+        now = time.time()
+        if not force_refresh and self.catalog_cache and (now - self.cache_timestamp) < self.CACHE_TTL:
+            logger.info("Returning cached catalog")
+            return self.catalog_cache
+        
+        async with self._catalog_lock:
+            if self._mcp_in_backoff():
+                now = time.time()
+                if now - self._last_backoff_log > 30:
+                    logger.warning(
+                        f"MCP backoff active for {int(self._mcp_backoff_until - now)}s: {self._last_mcp_error}"
+                    )
+                    self._last_backoff_log = now
+                if self.catalog_cache:
+                    logger.warning("Returning cached catalog due to MCP backoff")
+                    return self.catalog_cache
+                return {"products": [], "total": 0, "variant_keys": set()}
+            # Re-check cache after acquiring lock
+            now = time.time()
+            if not force_refresh and self.catalog_cache and (now - self.cache_timestamp) < self.CACHE_TTL:
+                logger.info("Returning cached catalog")
+                return self.catalog_cache
+
+            try:
+                # Fetch all enabled products with pagination
+                all_products = []
+                offset = 0
+                limit = 100
+            
+                while True:
+                    result = await self._call_tool_with_retry(
+                        "catalog_search",
+                        {"limit": limit, "offset": offset}
+                    )
+                
+                    # Parse result
+                    page_items: List[Dict[str, Any]] = []
+                    batch_products: List[Dict[str, Any]] = []
+                    if isinstance(result, dict) and "items" in result and isinstance(result["items"], list):
+                        page_items = result["items"]
+                        batch_products = [p for p in page_items if p.get("enabled", False)]
+                
+                    all_products.extend(batch_products)
+                
+                    # Stop condition must use UNFILTERED page size
+                    if len(page_items) < limit:
+                        break
+                    
+                    offset += limit
+                
+                    # Safety limit to prevent infinite loops
+                    if offset > 1000:
+                        logger.warning("Hit pagination safety limit at 1000 products")
+                        break
+            
+                # Enrich products with in-stock variants
+                semaphore = asyncio.Semaphore(8)
+
+                async def enrich_product(product: Dict[str, Any]):
+                    product_id = int(product.get("id") or 0)
+                    if product_id <= 0:
+                        product["variants"] = []
+                        return
+                    try:
+                        async with semaphore:
+                            variants = await self._fetch_variants_for_product(product_id)
+                        product["variants"] = variants
+                    except Exception as e:
+                        logger.warning(f"Variant enrichment failed for product {product_id}: {e}")
+                        product["variants"] = []
+
+                await asyncio.gather(*(enrich_product(p) for p in all_products), return_exceptions=True)
+
+                # Build variant key set for validation
+                variant_keys = {
+                    str(v.get("variantKey"))
+                    for p in all_products
+                    for v in (p.get("variants") or [])
+                    if v.get("variantKey")
+                }
+            
+                catalog = {
+                    "products": all_products,
+                    "total": len(all_products),
+                    "variant_keys": variant_keys,
+                    "last_updated": now
+                }
+            
+                # Cache it
+                self.catalog_cache = catalog
+                self.cache_timestamp = now
+            
+                logger.info(f"Fetched {len(all_products)} enabled products")
+                return catalog
+            
+            except Exception as e:
+                logger.error(f"Failed to get catalog: {e}")
+                # Return cached data if available, even if stale
+                if self.catalog_cache:
+                    logger.warning("Returning stale cached catalog due to error")
+                    return self.catalog_cache
+                return {"products": [], "total": 0, "variant_keys": set()}
+    
+    async def cleanup(self):
+        """Clean up resources properly."""
+        try:
+            logger.info("MCP cleanup completed")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+
+# Global instances
+mcp_client = MCPClient()
+ollama_client: Optional[httpx.AsyncClient] = None
+mcp_http_client: Optional[httpx.AsyncClient] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan with proper resource management."""
+    global ollama_client, mcp_http_client
+    
+    # Startup
+    logger.info("Starting up...")
+    try:
+        ollama_client = httpx.AsyncClient(timeout=30.0)
+        mcp_http_client = httpx.AsyncClient(
+            timeout=mcp_client.MCP_TIMEOUT_SEC,
+            headers={"Accept": "application/json"}
+        )
+        logger.info("Startup complete")
+    except Exception as e:
+        logger.error(f"Startup failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down...")
+    if ollama_client:
+        await ollama_client.aclose()
+    if mcp_http_client:
+        await mcp_http_client.aclose()
+    await mcp_client.cleanup()
+    logger.info("Shutdown complete")
+
+
+# FastAPI app
+app = FastAPI(
+    title="Shopping Assistant API",
+    description="Stateless shopping assistant that recommends enabled products",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS - Fix wildcard + credentials issue
+if ALLOWED_ORIGINS == ["*"]:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # Must be False with wildcard
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+# Request/Response Models
+class Message(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")  # No system from client!
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
+class ProductLink(BaseModel):
+    id: int
+    name: str
+    combinationId: int
+    variantKey: str
+    variantLabel: str
+    price: float
+    sku: Optional[str] = None
+    url: Optional[str] = None
+    options: List[Dict[str, Any]] = Field(default_factory=list)
+    selectedOptions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class PendingChoice(BaseModel):
+    type: str = Field(..., pattern="^choose_for_cart$")
+    options: List[ProductLink] = Field(default_factory=list)
+    quantity: int = Field(1, ge=1, le=20)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    history: Optional[List[Message]] = Field(None, max_items=20)
+    pending: Optional[PendingChoice] = None
+    stream: Optional[bool] = False
+
+
+class CartAction(BaseModel):
+    type: str  # "cart.add" | "cart.open" | "cart.checkout"
+    productId: int
+    combinationId: int
+    quantity: int
+    sku: Optional[str] = None
+    options: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ChatResponse(BaseModel):
+    message: str
+    model: str
+    in_stock_products: int
+    validated: bool = True
+    products: List[ProductLink] = Field(default_factory=list)
+    cart_actions: List[CartAction] = Field(default_factory=list)
+    pending: Optional[PendingChoice] = None
+
+
+# Helper functions
+async def call_ollama(messages: List[Dict[str, str]]) -> str:
+    """Call Ollama API using shared client and return response text."""
+    try:
+        if not ollama_client:
+            raise HTTPException(status_code=503, detail="LLM service not initialized")
+        
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": MODEL_TEMPERATURE
+            }
+        }
+        
+        headers = {}
+        if OLLAMA_API_KEY:
+            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+        
+        response = await ollama_client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            headers=headers
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        return data.get("message", {}).get("content", "")
+        
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ollama API error: {e.response.status_code}")
+        raise HTTPException(
+            status_code=502,
+            detail="LLM service unavailable"
+        )
+    except httpx.TimeoutException:
+        logger.error("Ollama timeout")
+        raise HTTPException(status_code=504, detail="LLM request timeout")
+    except Exception as e:
+        logger.error(f"Ollama call failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process request")
+
+
+async def call_ollama_stream(messages: List[Dict[str, str]]):
+    """Stream Ollama API responses as text chunks."""
+    try:
+        if not ollama_client:
+            raise HTTPException(status_code=503, detail="LLM service not initialized")
+        
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": MODEL_TEMPERATURE
+            }
+        }
+        
+        headers = {}
+        if OLLAMA_API_KEY:
+            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+        
+        async with ollama_client.stream(
+            "POST",
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            headers=headers
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = data.get("message", {})
+                if content := msg.get("content"):
+                    yield content
+                if data.get("done"):
+                    break
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ollama API error: {e.response.status_code}")
+        raise HTTPException(status_code=502, detail="LLM service unavailable")
+    except httpx.TimeoutException:
+        logger.error("Ollama timeout")
+        raise HTTPException(status_code=504, detail="LLM request timeout")
+    except Exception as e:
+        logger.error(f"Ollama stream failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process request")
+
+
+def make_variant_key(product_id: Any, combination_id: Any) -> str:
+    """Build a stable variant key: productId:combinationId."""
+    return f"{int(product_id)}:{int(combination_id)}"
+
+
+VARIANT_KEY_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+
+def parse_variant_key_ids(variant_key: str) -> tuple[Optional[int], Optional[int]]:
+    if not variant_key:
+        return None, None
+    match = VARIANT_KEY_RE.match(str(variant_key).strip())
+    if not match:
+        return None, None
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except (TypeError, ValueError):
+        return None, None
+
+
+def normalize_product_options(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for opt in raw:
+        if not isinstance(opt, dict):
+            continue
+        name = opt.get("name") or opt.get("title") or opt.get("optionName") or opt.get("option_name")
+        if not name:
+            continue
+        choices_raw = opt.get("choices")
+        choices: List[Dict[str, Any]] = []
+        if isinstance(choices_raw, list):
+            for choice in choices_raw:
+                text: Optional[str] = None
+                if isinstance(choice, dict):
+                    text = (
+                        choice.get("text")
+                        or choice.get("value")
+                        or choice.get("title")
+                        or choice.get("name")
+                    )
+                elif choice:
+                    text = str(choice)
+                if text:
+                    choices.append({"text": str(text)})
+        normalized.append({
+            "name": str(name),
+            "choices": choices,
+        })
+    return normalized
+
+
+def normalize_selected_options(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        selected: List[Dict[str, Any]] = []
+        for key, value in raw.items():
+            if key and value:
+                selected.append({"name": str(key), "value": str(value)})
+        return selected
+    if not isinstance(raw, list):
+        return []
+    selected: List[Dict[str, Any]] = []
+    for opt in raw:
+        if isinstance(opt, dict):
+            name = opt.get("name") or opt.get("optionName") or opt.get("option_name")
+            value = (
+                opt.get("value")
+                or opt.get("text")
+                or opt.get("valueName")
+                or opt.get("value_name")
+                or opt.get("title")
+            )
+        else:
+            name = None
+            value = None
+        if name and value:
+            selected.append({"name": str(name), "value": str(value)})
+    return selected
+
+
+def format_catalog_for_prompt(catalog: Dict[str, Any]) -> str:
+    """Format catalog as both human-readable and machine-checkable."""
+    products = catalog.get("products", [])
+
+    if not products:
+        return "CATALOG: Currently empty - no enabled products\nALLOWED_VARIANTS: []"
+
+    variants_list: List[Dict[str, Any]] = []
+    for p in products:
+        for v in (p.get("variants") or []):
+            if not isinstance(v, dict):
+                continue
+            if v.get("in_stock") is False:
+                continue
+            if v.get("variantKey") is None:
+                continue
+            variants_list.append({"product": p, "variant": v})
+
+    allowed_variants = [
+        {
+            "k": entry["variant"].get("variantKey"),
+            "name": entry["product"].get("name", "Unknown"),
+            "label": entry["variant"].get("label") or "Default",
+            "price": float(entry["variant"].get("price", 0) or 0),
+        }
+        for entry in variants_list
+        if entry.get("variant") and entry["variant"].get("variantKey")
+    ]
+    allowed_list = f"ALLOWED_VARIANTS: {json.dumps(allowed_variants)}"
+
+    lines = ["\n=== ENABLED CATALOG (VARIANTS) ==="]
+    total_variants = len(variants_list)
+    shown = 0
+    for entry in variants_list:
+        if shown >= 50:
+            break
+        product = entry["product"]
+        variant = entry["variant"]
+        variant_id = variant.get("variantKey")
+        name = product.get("name", "Unknown")
+        label = variant.get("label") or "Default"
+        price = float(variant.get("price", 0) or 0)
+        lines.append(f"\n[V:{variant_id}] {name} — {label} – ${price:.2f}")
+        shown += 1
+
+    if total_variants > shown:
+        lines.append(f"\n... and {total_variants - shown} more variants")
+
+    lines.append(f"\n=== TOTAL ENABLED VARIANTS: {total_variants} ===")
+
+    return allowed_list + "\n" + "\n".join(lines)
+
+
+def validate_response_variant_keys(response_text: str, allowed_variant_keys: Set[str]) -> tuple[bool, Set[str]]:
+    """
+    Validate that response only mentions allowed variant keys.
+    Returns (is_valid, invalid_variant_keys_found).
+    """
+    if not allowed_variant_keys or not response_text:
+        return True, set()
+
+    allowed_normalized = {s.strip().lower() for s in allowed_variant_keys if s.strip()}
+
+    variant_pattern = r'\[V:(\d+:\d+)\]'
+
+    found_variants = set()
+    for match in re.finditer(variant_pattern, response_text):
+        for group in match.groups():
+            if group:
+                found_variants.add(group.strip().lower())
+
+    invalid_variants = found_variants - allowed_normalized
+    if invalid_variants:
+        logger.warning(f"Response mentioned invalid variant keys: {invalid_variants}")
+        return False, invalid_variants
+
+    return True, set()
+
+
+def extract_variant_keys_in_order(response_text: str) -> List[str]:
+    """Extract variant keys in order of appearance from response text."""
+    if not response_text:
+        return []
+
+    variant_pattern = r'\[V:(\d+:\d+)\]'
+    seen: Set[str] = set()
+    ordered: List[str] = []
+
+    for match in re.finditer(variant_pattern, response_text):
+        for group in match.groups():
+            if not group:
+                continue
+            variant_id = group.strip()
+            key = variant_id.lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(variant_id)
+
+    return ordered
+
+
+def strip_variant_tags(response_text: str, variant_keys: Optional[List[str]] = None) -> str:
+    """Remove variant markers like [V:productId:combinationId] from user-facing text."""
+    if not response_text:
+        return response_text
+    cleaned = re.sub(
+        r'^(\s*(?:[-•]\s*|\d+[\.\)]\s*)?)\[V:\d+:\d+\]\s*',
+        r'\1',
+        response_text,
+        flags=re.MULTILINE
+    )
+    if variant_keys:
+        for variant_key in variant_keys:
+            cleaned = re.sub(rf'\[V:{re.escape(variant_key)}\]', '', cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def looks_like_recommendation(text: str) -> bool:
+    if not text:
+        return False
+    has_price = bool(re.search(r"\$\s*\d", text))
+    has_list_marker = bool(re.search(r"(^|\n)\s*(?:[-•]|\d+[\.\)])\s+", text))
+    return has_price and has_list_marker
+
+
+def looks_like_cart_commitment(text: str) -> bool:
+    t = (text or "").lower()
+    return bool(re.search(
+        r"\b(add(ed|ing)?|put(ting)?|toss(ing)?|dropp(ing)?)\b.*\b(cart|bag)\b|\badded to your cart\b",
+        t
+    ))
+
+
+def parse_packed_history_message(message: str) -> tuple[Optional[List[Message]], Optional[str]]:
+    if not message:
+        return None, message
+    marker = "history context:"
+    prompt_marker = "\n\nprompt:\n"
+    lower = message.lower()
+    if not lower.startswith(marker):
+        return None, message
+    prompt_idx = lower.find(prompt_marker)
+    if prompt_idx == -1:
+        return None, message
+    history_text = message[len(marker):prompt_idx].strip()
+    prompt_text = message[prompt_idx + len(prompt_marker):].strip()
+    if not prompt_text:
+        prompt_text = message
+
+    history: List[Message] = []
+    for raw_line in history_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("user:"):
+            content = line[5:].strip()
+            if content:
+                history.append(Message(role="user", content=content))
+        elif line.lower().startswith("assistant:"):
+            content = line[10:].strip()
+            if content:
+                history.append(Message(role="assistant", content=content))
+
+    return (history or None), prompt_text
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+async def resolve_selection_indexes_with_llm(
+    user_text: str,
+    last_assistant: str,
+    options: List[Dict[str, Any]]
+) -> List[int]:
+    if not user_text or not last_assistant or not options:
+        return []
+
+    option_lines = []
+    for idx, opt in enumerate(options):
+        name = opt.get("name", "Unknown")
+        label = opt.get("label") or "Default"
+        price = opt.get("price")
+        if isinstance(price, (int, float)):
+            option_lines.append(f"{idx}) {name} — {label} – ${price:.2f}")
+        else:
+            option_lines.append(f"{idx}) {name} — {label}")
+
+    user_content = (
+        "Assistant message:\n"
+        f"{last_assistant}\n\n"
+        "User reply:\n"
+        f"{user_text}\n\n"
+        "Options:\n"
+        + "\n".join(option_lines)
+        + "\n\nReturn only JSON."
+    )
+
+    messages = [
+        {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+
+    try:
+        raw = await call_ollama(messages)
+    except Exception as e:
+        logger.warning(f"Selection resolver failed: {e}")
+        return []
+
+    data = _extract_json_object(raw)
+    if not data:
+        return []
+    if "indexes" in data:
+        raw_indexes = data.get("indexes")
+        if raw_indexes is None:
+            return []
+        if isinstance(raw_indexes, (int, str)):
+            raw_indexes = [raw_indexes]
+        if not isinstance(raw_indexes, list):
+            return []
+        cleaned: List[int] = []
+        seen: Set[int] = set()
+        for item in raw_indexes:
+            try:
+                idx_int = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx_int < len(options) and idx_int not in seen:
+                seen.add(idx_int)
+                cleaned.append(idx_int)
+        return cleaned
+    if "index" in data:
+        idx = data.get("index")
+        if idx is None:
+            return []
+        try:
+            idx_int = int(idx)
+        except (TypeError, ValueError):
+            return []
+        if 0 <= idx_int < len(options):
+            return [idx_int]
+    return []
+
+
+ADD_INTENT_RE = re.compile(r"\b(add|put|throw)\b.*\b(cart|bag)\b|\badd\b", re.IGNORECASE)
+
+
+def parse_quantity(text: str) -> int:
+    # "add 2", "add 2x", "add x2" etc.
+    m = re.search(r"\b(\d{1,2})\s*(x|×)?\b", text.lower())
+    if m:
+        q = int(m.group(1))
+        return max(1, min(q, 20))
+    return 1
+
+
+def should_add_to_cart(user_text: str) -> bool:
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False
+    return bool(ADD_INTENT_RE.search(t)) and ("cart" in t or "bag" in t or t.startswith("add "))
+
+def wants_multiple_distinct_items(text: str) -> bool:
+    t = (text or "").lower()
+    if "both" in t or "all" in t:
+        return True
+    if re.search(r"\b(last|first|these|those)\s+\d+\b", t):
+        return True
+    return False
+
+def extract_single_ordinal_index(text: str, total: int) -> Optional[int]:
+    if not text or total <= 0:
+        return None
+    t = text.lower()
+    if re.search(r"\blast\s+one\b|\bthe\s+last\b|\blast\b", t):
+        return total - 1
+    for word, idx in ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", t):
+            if 0 <= idx < total:
+                return idx
+    return None
+
+def enforce_single_ordinal_cart_actions(
+    user_text: str,
+    cart_actions: List[CartAction]
+) -> List[CartAction]:
+    if len(cart_actions) <= 1:
+        return cart_actions
+    idx = extract_single_ordinal_index(user_text, len(cart_actions))
+    if idx is None:
+        return cart_actions
+    return [cart_actions[idx]]
+
+ORDINAL_WORDS = {
+    "first": 0,
+    "second": 1,
+    "third": 2,
+    "fourth": 3,
+    "fifth": 4,
+    "sixth": 5,
+    "seventh": 6,
+    "eighth": 7,
+    "ninth": 8,
+    "tenth": 9,
+}
+
+CARDINAL_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def parse_multi_indices(text: str, total_options: Optional[int]) -> List[int]:
+    if not text:
+        return []
+    t = text.lower()
+    if total_options and re.search(r"\b(all|every|all of them)\b", t):
+        return list(range(total_options))
+    if total_options == 2 and re.search(r"\b(both|both of them|those two|these two)\b", t):
+        return [0, 1]
+    if total_options:
+        count_token = r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)"
+        last_match = re.search(rf"\blast\s+({count_token})\b", t)
+        if last_match:
+            raw = last_match.group(1)
+            try:
+                count = int(raw)
+            except ValueError:
+                count = CARDINAL_WORDS.get(raw, 0)
+            count = max(0, min(count or 0, total_options))
+            if count:
+                start = max(total_options - count, 0)
+                return list(range(start, total_options))
+        first_match = re.search(rf"\bfirst\s+({count_token})\b", t)
+        if first_match:
+            raw = first_match.group(1)
+            try:
+                count = int(raw)
+            except ValueError:
+                count = CARDINAL_WORDS.get(raw, 0)
+            count = max(0, min(count or 0, total_options))
+            if count:
+                return list(range(count))
+
+    indices: List[int] = []
+    seen: Set[int] = set()
+    token_re = re.compile(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\b"
+        r"|\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last"
+        r"|one|two|three|four|five|six|seven|eight|nine|ten)\b"
+    )
+    for match in token_re.finditer(t):
+        num = None
+        if match.group(1):
+            try:
+                num = int(match.group(1)) - 1
+            except ValueError:
+                num = None
+        else:
+            word = match.group(2)
+            if word == "last" and total_options:
+                num = total_options - 1
+            elif word in ORDINAL_WORDS:
+                num = ORDINAL_WORDS[word]
+            elif word in CARDINAL_WORDS:
+                num = CARDINAL_WORDS[word] - 1
+        if num is None:
+            continue
+        if total_options is not None and (num < 0 or num >= total_options):
+            continue
+        if num not in seen:
+            seen.add(num)
+            indices.append(num)
+    return indices
+
+
+def looks_like_selection_reply(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    if re.search(r"\b(both|either|all|one|two|three|first|second|third|fourth|fifth|last)\b", t):
+        return True
+    return bool(re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\b", t))
+
+def detect_variant_list_request(user_text: str) -> Optional[str]:
+    if not user_text:
+        return None
+    text = user_text.strip()
+    patterns = [
+        r"^\s*(?:list|show)\s+(?:me\s+)?(?:the\s+)?variants?\s+(?:for|of)\s+(.+)$",
+        r"^\s*variants?\s+(?:for|of)\s+(.+)$",
+        r"^\s*(?:options|flavors|sizes)\s+(?:for|of)\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match and match.group(1):
+            return match.group(1).strip()
+    return None
+
+def _match_score(query: str, name: str) -> int:
+    q = re.sub(r"[^a-z0-9\s]", " ", (query or "").lower()).strip()
+    n = re.sub(r"[^a-z0-9\s]", " ", (name or "").lower()).strip()
+    if not q or not n:
+        return 0
+    if q in n:
+        return 100 + len(q)
+    q_tokens = {t for t in q.split() if t}
+    n_tokens = {t for t in n.split() if t}
+    if not q_tokens:
+        return 0
+    return len(q_tokens & n_tokens)
+
+def find_best_product(products: List[Dict[str, Any]], query: str) -> Optional[Dict[str, Any]]:
+    best = None
+    best_score = 0
+    for p in products:
+        name = p.get("name", "")
+        score = _match_score(query, name)
+        if score > best_score:
+            best_score = score
+            best = p
+    return best if best_score > 0 else None
+
+def user_specified_variant(user_text: str, variant_label: str, variant_key: str) -> bool:
+    if not user_text:
+        return False
+    text = user_text.lower()
+    if variant_key and variant_key.lower() in text:
+        return True
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", (variant_label or "").lower()) if len(t) >= 2]
+    if not tokens:
+        return False
+    return any(tok in text for tok in tokens)
+
+
+def extract_variant_candidates_from_text(
+    text: str,
+    products: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not text or not products:
+        return []
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for line in lines:
+        best_product = None
+        best_score = 0
+        for product in products:
+            name = product.get("name", "")
+            score = _match_score(name, line)
+            if score > best_score:
+                best_score = score
+                best_product = product
+        if not best_product or best_score < 2:
+            continue
+
+        variants = [
+            v for v in (best_product.get("variants") or [])
+            if v.get("variantKey") and v.get("in_stock") is not False
+        ]
+        if not variants:
+            continue
+
+        chosen = None
+        if len(variants) == 1:
+            chosen = variants[0]
+        else:
+            matches = [
+                v for v in variants
+                if user_specified_variant(line, v.get("label") or "", str(v.get("variantKey") or ""))
+            ]
+            if len(matches) == 1:
+                chosen = matches[0]
+
+        if not chosen:
+            continue
+
+        key = str(chosen.get("variantKey") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"product": best_product, "variant": chosen})
+
+    return candidates
+
+
+def infer_product_links_from_text(
+    text: str,
+    products: List[Dict[str, Any]]
+) -> List[ProductLink]:
+    inferred = extract_variant_candidates_from_text(text, products)
+    links: List[ProductLink] = []
+    for entry in inferred:
+        link = build_product_link(entry.get("product") or {}, entry.get("variant") or {})
+        if link:
+            links.append(link)
+    return links
+
+
+def get_last_assistant_and_prev_user(
+    history: Optional[List[Message]]
+) -> tuple[Optional[str], Optional[str]]:
+    if not history:
+        return None, None
+    last_assistant = None
+    prev_user = None
+    last_prev_user = None
+    for msg in history:
+        if msg.role == "user":
+            prev_user = msg.content
+        elif msg.role == "assistant":
+            last_assistant = msg.content
+            last_prev_user = prev_user
+    return last_assistant, last_prev_user
+
+
+async def resolve_selection_from_history(
+    user_text: str,
+    history: Optional[List[Message]],
+    products: List[Dict[str, Any]]
+) -> Optional[tuple[List[Dict[str, Any]], Optional[str]]]:
+    last_assistant, prev_user = get_last_assistant_and_prev_user(history)
+    if not last_assistant:
+        return None
+
+    candidates = extract_variant_candidates_from_text(last_assistant, products)
+    if not candidates:
+        return None
+
+    options_for_llm = []
+    for entry in candidates:
+        product = entry.get("product") or {}
+        variant = entry.get("variant") or {}
+        options_for_llm.append({
+            "name": product.get("name", "Unknown"),
+            "label": variant.get("label") or "Default",
+            "price": variant.get("price", 0)
+        })
+
+    selection_indices = parse_multi_indices(user_text, len(candidates))
+    if not selection_indices:
+        selection_indices = await resolve_selection_indexes_with_llm(
+            user_text,
+            last_assistant,
+            options_for_llm
+        )
+
+    if not selection_indices:
+        return None
+
+    chosen_entries = [candidates[idx] for idx in selection_indices if 0 <= idx < len(candidates)]
+    if not chosen_entries:
+        return None
+    return chosen_entries, prev_user
+
+def pick_cart_candidates(
+    user_text: str,
+    product_links: List[ProductLink],
+    products: List[Dict[str, Any]]
+) -> tuple[List[ProductLink], Optional[str]]:
+    if not product_links:
+        return [], None
+    if len(product_links) == 1:
+        return product_links, "single"
+
+    text = (user_text or "").strip()
+    if not text:
+        return [], None
+
+    selection_indices = parse_multi_indices(text, len(product_links))
+    if selection_indices:
+        return [product_links[i] for i in selection_indices], "index"
+
+    explicit_matches: List[ProductLink] = []
+    for link in product_links:
+        if user_specified_variant(text, link.variantLabel or "", str(link.variantKey or "")):
+            explicit_matches.append(link)
+
+    if explicit_matches:
+        if len(explicit_matches) == 1:
+            return explicit_matches, "explicit"
+        return [], None
+
+    name_matches: List[ProductLink] = []
+    lower_text = text.lower()
+    for link in product_links:
+        if link.name and link.name.lower() in lower_text:
+            name_matches.append(link)
+
+    if name_matches:
+        if len(name_matches) == 1:
+            return name_matches, "name"
+        return [], None
+
+    return [], None
+
+
+def build_cart_actions(
+    user_text: str,
+    product_links: List[ProductLink],
+    products: List[Dict[str, Any]]
+) -> List[CartAction]:
+    if not should_add_to_cart(user_text):
+        return []
+    candidates, reason = pick_cart_candidates(user_text, product_links, products)
+    if not candidates:
+        return []
+    qty = parse_quantity(user_text)
+    if len(candidates) >= 2 and wants_multiple_distinct_items(user_text):
+        qty = 1
+    actions: List[CartAction] = []
+    for candidate in candidates:
+        pid = int(candidate.id or 0)
+        cid = int(candidate.combinationId or 0)
+        label = candidate.variantLabel or ""
+        allow_add = True
+        if reason == "name":
+            allow_add = product_has_single_variant(products, pid) or user_specified_variant(
+                user_text, label, str(candidate.variantKey or "")
+            )
+        if not allow_add:
+            continue
+        actions.append(
+            CartAction(
+                type="cart.add",
+                productId=pid,
+                combinationId=cid,
+                quantity=qty,
+                sku=candidate.sku,
+                options=candidate.selectedOptions or []
+            )
+        )
+    return actions
+
+
+def build_cart_actions_from_links(
+    product_links: List[ProductLink],
+    quantity: int
+) -> List[CartAction]:
+    actions: List[CartAction] = []
+    for link in product_links:
+        actions.append(
+            CartAction(
+                type="cart.add",
+                productId=int(link.id or 0),
+                combinationId=int(link.combinationId or 0),
+                quantity=quantity,
+                sku=link.sku,
+                options=link.selectedOptions or []
+            )
+        )
+    return actions
+
+
+def build_cart_confirmation_message(cart_actions: List[CartAction]) -> Optional[str]:
+    if not cart_actions:
+        return None
+    total_qty = sum(action.quantity for action in cart_actions if action.quantity) or len(cart_actions)
+    if total_qty == 1:
+        return "Added to your cart."
+    return f"Added {total_qty} items to your cart."
+
+
+def merge_product_links(existing: List[ProductLink], new_links: List[ProductLink]) -> List[ProductLink]:
+    if not new_links:
+        return existing
+    combined = list(existing) if existing else []
+    existing_keys = {str(p.variantKey).lower() for p in combined if p.variantKey}
+    for link in new_links:
+        key = str(link.variantKey).lower() if link.variantKey else ""
+        if key and key not in existing_keys:
+            existing_keys.add(key)
+            combined.append(link)
+    return combined
+
+
+def should_include_products(
+    user_text: str,
+    response_text: str,
+    product_links: List[ProductLink],
+    pending: Optional[PendingChoice],
+    cart_actions: List[CartAction]
+) -> bool:
+    if cart_actions:
+        return False
+    if pending and pending.options:
+        return True
+    if not product_links:
+        return False
+    if looks_like_recommendation(response_text):
+        return True
+    if re.search(r"\bwhich one\b|\bchoose\b|\b1 or 2\b", response_text or "", flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def resolve_pending_choice(
+    user_text: str,
+    pending: Optional[PendingChoice],
+    products: List[Dict[str, Any]]
+) -> tuple[List[CartAction], Optional[PendingChoice]]:
+    if not pending or not pending.options:
+        return [], None
+    selected_links, _ = pick_cart_candidates(user_text, pending.options, products)
+    if selected_links:
+        qty = pending.quantity or 1
+        if len(selected_links) >= 2 and wants_multiple_distinct_items(user_text):
+            qty = 1
+        return build_cart_actions_from_links(selected_links, qty), None
+    text = (user_text or "").strip().lower()
+    mentions_option = False
+    for option in pending.options:
+        if option.name and option.name.lower() in text:
+            mentions_option = True
+            break
+        if user_specified_variant(text, option.variantLabel or "", str(option.variantKey or "")):
+            mentions_option = True
+            break
+    if looks_like_selection_reply(user_text) or mentions_option:
+        return [], pending
+    return [], None
+
+def build_product_links_from_variant_keys(
+    variant_keys: List[str],
+    products: List[Dict[str, Any]],
+    allowed_variant_keys: Set[str]
+) -> List[ProductLink]:
+    """Build product link payloads from variant keys and catalog."""
+    if not variant_keys or not products:
+        return []
+
+    index: Dict[str, Dict[str, Any]] = {}
+    for p in products:
+        for v in (p.get("variants") or []):
+            if isinstance(v, dict) and v.get("in_stock") is False:
+                continue
+            variant_key = str(v.get("variantKey") or "").strip()
+            if variant_key:
+                index[variant_key.lower()] = {"product": p, "variant": v}
+
+    links: List[ProductLink] = []
+    allowed = {s.strip().lower() for s in allowed_variant_keys if s.strip()}
+
+    for variant_key in variant_keys:
+        variant_key_norm = str(variant_key or "").strip().lower()
+        if allowed and variant_key_norm not in allowed:
+            continue
+        entry = index.get(variant_key_norm)
+        if not entry:
+            continue
+        product = entry["product"]
+        variant = entry["variant"]
+        link = build_product_link(product, variant)
+        if link:
+            links.append(link)
+
+    return links
+
+
+def build_product_link(product: Dict[str, Any], variant: Dict[str, Any]) -> Optional[ProductLink]:
+    key_value = str(variant.get("variantKey") or "").strip()
+    if not key_value:
+        return None
+
+    pid = product.get("id")
+    cid = variant.get("combinationId")
+    parsed_pid, parsed_cid = parse_variant_key_ids(key_value)
+
+    if (pid is None or pid == 0) and parsed_pid is not None:
+        pid = parsed_pid
+    if cid is None and parsed_cid is not None:
+        cid = parsed_cid
+
+    product_options = normalize_product_options(product.get("options"))
+    selected_options = normalize_selected_options(variant.get("options"))
+
+    return ProductLink(
+        id=int(pid or 0),
+        name=product.get("name", "Unknown"),
+        combinationId=int(cid or 0),
+        variantKey=key_value,
+        variantLabel=variant.get("label") or "Default",
+        price=float(variant.get("price", 0) or 0),
+        sku=(variant.get("effectiveSku") or "").strip() or None,
+        url=product.get("url") or None,
+        options=product_options,
+        selectedOptions=selected_options
+    )
+
+
+def product_has_single_variant(products: List[Dict[str, Any]], product_id: int) -> bool:
+    """Return True if a product has exactly one in-stock variant."""
+    for product in products:
+        try:
+            pid = int(product.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid != product_id:
+            continue
+        variants = [
+            v for v in (product.get("variants") or [])
+            if v.get("variantKey") and v.get("in_stock") is not False
+        ]
+        return len(variants) == 1
+    return False
+
+
+def _sse_event(payload: Dict[str, Any]) -> str:
+    """Format a JSON payload as an SSE data event."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+# API Endpoints
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {"status": "ok", "service": "shopping-assistant"}
+
+
+@app.get("/health")
+async def health():
+    """Detailed health check."""
+    try:
+        catalog = await mcp_client.get_catalog()
+        cache_age = time.time() - mcp_client.cache_timestamp if mcp_client.catalog_cache else None
+        return {
+            "status": "healthy",
+            "mcp_connected": mcp_http_client is not None,
+            "in_stock_products": catalog.get("total", 0),
+            "model": OLLAMA_MODEL,
+            "cache_age_seconds": cache_age
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": "Service degraded"}
+        )
+
+
+@app.get("/catalog")
+async def get_catalog(authorization: Optional[str] = Header(None)):
+    """Get current enabled catalog (admin endpoint)."""
+    if API_KEY and authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    catalog = await mcp_client.get_catalog()
+    # Don't expose internal set object
+    return {
+        "products": catalog.get("products", []),
+        "total": catalog.get("total", 0),
+        "last_updated": catalog.get("last_updated")
+    }
+
+
+def get_safe_fallback(catalog: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    Generate a safe fallback response when model validation fails.
+    Returns deterministic recommendations from catalog.
+    """
+    products = catalog.get("products", [])
+
+    if not products:
+        return (
+            "I apologize, but I'm having trouble accessing our inventory right now. Please try again in a moment.",
+            []
+        )
+
+    variants: List[Dict[str, Any]] = []
+    for p in products:
+        for v in (p.get("variants") or []):
+            if not isinstance(v, dict):
+                continue
+            if v.get("in_stock") is False:
+                continue
+            if v.get("variantKey") is None:
+                continue
+            variants.append({"product": p, "variant": v})
+
+    if not variants:
+        return (
+            "I apologize, but I'm having trouble accessing our inventory right now. Please try again in a moment.",
+            []
+        )
+
+    # Get top 3 variants (deterministic, no hallucination possible)
+    top_variants = variants[:3]
+
+    lines = ["I'm having trouble matching items to our live inventory. Here are some popular options:\n"]
+
+    for entry in top_variants:
+        product = entry["product"]
+        variant = entry["variant"]
+        name = product.get("name", "Unknown")
+        label = variant.get("label") or "Default"
+        price = variant.get("price", 0)
+        lines.append(f"• {name} — {label} - ${price:.2f}")
+
+    lines.append("\nWhat type of product are you looking for? I can help you find exactly what you need.")
+
+    return "\n".join(lines), top_variants
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Chat with the shopping assistant.
+    
+    The assistant only recommends products currently enabled in the catalog.
+    Validates responses to prevent hallucinated recommendations.
+    """
+    try:
+        # Optional API key check
+        if API_KEY and authorization != f"Bearer {API_KEY}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        # Support packed history in message payload
+        packed_history, packed_prompt = parse_packed_history_message(request.message)
+        if packed_prompt and packed_prompt != request.message:
+            request.message = packed_prompt
+        if packed_history:
+            if request.history:
+                request.history = packed_history + request.history
+            else:
+                request.history = packed_history
+
+        # Get current catalog
+        catalog = await mcp_client.get_catalog()
+        catalog_text = format_catalog_for_prompt(catalog)
+        allowed_variant_keys = {
+            str(v.get("variantKey"))
+            for p in catalog.get("products", [])
+            for v in (p.get("variants") or [])
+            if v.get("variantKey")
+        }
+        allowed_variant_keys = {s for s in allowed_variant_keys if s}
+
+        variant_query = detect_variant_list_request(request.message)
+        if variant_query:
+            product = find_best_product(catalog.get("products", []), variant_query)
+            if not product:
+                message = f"I couldn't find \"{variant_query}\" in our catalog. Want me to search for something else?"
+                return ChatResponse(
+                    message=message,
+                    model=OLLAMA_MODEL,
+                    in_stock_products=catalog.get("total", 0),
+                    validated=True,
+                    products=[],
+                    cart_actions=[]
+                )
+
+            variants = [
+                v for v in (product.get("variants") or [])
+                if isinstance(v, dict) and v.get("in_stock") is not False and v.get("variantKey")
+            ]
+            name = product.get("name", "that item")
+            if not variants:
+                message = f"{name} has just one option right now."
+                return ChatResponse(
+                    message=message,
+                    model=OLLAMA_MODEL,
+                    in_stock_products=catalog.get("total", 0),
+                    validated=True,
+                    products=[],
+                    cart_actions=[]
+                )
+
+            lines = [f"Here are the available options for {name}:"]
+            for v in variants[:10]:
+                label = v.get("label") or "Default"
+                price = float(v.get("price", 0) or 0)
+                lines.append(f"• {label} – ${price:.2f}")
+            lines.append("Which one would you like?")
+            message = "\n".join(lines)
+
+            product_links = []
+            for v in variants[:10]:
+                link = build_product_link(product, v)
+                if link:
+                    product_links.append(link)
+
+            if request.stream:
+                async def event_generator():
+                    yield _sse_event({"event": "delta", "content": message})
+                    yield _sse_event({
+                        "event": "final",
+                        "message": message,
+                        "model": OLLAMA_MODEL,
+                        "in_stock_products": catalog.get("total", 0),
+                        "validated": True,
+                        "products": [p.model_dump() for p in product_links],
+                        "cart_actions": []
+                    })
+                return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+            return ChatResponse(
+                message=message,
+                model=OLLAMA_MODEL,
+                in_stock_products=catalog.get("total", 0),
+                validated=True,
+                products=product_links,
+                cart_actions=[]
+            )
+        
+        # Build messages (system messages only from us, never from client)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": catalog_text}
+        ]
+        
+        # Add history if provided (only user/assistant roles allowed)
+        if request.history:
+            for msg in request.history:
+                messages.append({
+                    "role": msg.role,
+                    "content": msg.content
+                })
+        
+        # Add current user message
+        messages.append({
+            "role": "user",
+            "content": request.message
+        })
+
+        # Stream response if requested
+        if request.stream:
+            async def event_generator():
+                full_parts: List[str] = []
+                carry = ""
+                carry_len = 80
+                
+                async for chunk in call_ollama_stream(messages):
+                    full_parts.append(chunk)
+                    buffer = carry + chunk
+                    if len(buffer) <= carry_len:
+                        carry = buffer
+                        continue
+                    
+                    emit_part = buffer[:-carry_len]
+                    carry = buffer[-carry_len:]
+                    emit_part = strip_variant_tags(emit_part)
+                    emit_part = re.sub(r'\[[A-Za-z0-9_-]{1,64}\]', '', emit_part)
+                    if emit_part:
+                        yield _sse_event({"event": "delta", "content": emit_part})
+                
+                # Flush remaining carry
+                if carry:
+                    tail = strip_variant_tags(carry)
+                    tail = re.sub(r'\[[A-Za-z0-9_-]{1,64}\]', '', tail)
+                    if tail:
+                        yield _sse_event({"event": "delta", "content": tail})
+                
+                full_text = "".join(full_parts)
+                extracted_variant_keys = extract_variant_keys_in_order(full_text)
+                product_links = build_product_links_from_variant_keys(
+                    extracted_variant_keys,
+                    catalog.get("products", []),
+                    allowed_variant_keys
+                )
+                is_valid, _ = validate_response_variant_keys(full_text, allowed_variant_keys)
+
+                inferred_links = []
+                if not product_links:
+                    inferred_links = infer_product_links_from_text(
+                        full_text,
+                        catalog.get("products", [])
+                    )
+                    if inferred_links:
+                        product_links = inferred_links
+
+                needs_fallback = False
+                if not is_valid:
+                    if not inferred_links:
+                        needs_fallback = True
+                elif extracted_variant_keys and not product_links:
+                    needs_fallback = True
+                elif (not extracted_variant_keys) and (not product_links) and looks_like_recommendation(full_text):
+                    needs_fallback = True
+
+                if needs_fallback:
+                    logger.warning("Streaming response invalid; using safe fallback")
+                    safe_text, safe_products = get_safe_fallback(catalog)
+                    cleaned_full = safe_text
+                    product_links = []
+                    for entry in (safe_products or []):
+                        product = entry.get("product") or {}
+                        variant = entry.get("variant") or {}
+                        link = build_product_link(product, variant)
+                        if link:
+                            product_links.append(link)
+                    is_valid = True
+                else:
+                    cleaned_full = strip_variant_tags(full_text, extracted_variant_keys)
+
+                pending_response = None
+                cart_actions: List[CartAction] = []
+
+                pending_actions, pending_response = resolve_pending_choice(
+                    request.message,
+                    request.pending,
+                    catalog.get("products", [])
+                )
+                if pending_actions:
+                    cart_actions = pending_actions
+                elif pending_response:
+                    cart_actions = []
+                else:
+                    selection = await resolve_selection_from_history(
+                        request.message,
+                        request.history,
+                        catalog.get("products", [])
+                    )
+                    selected_links: List[ProductLink] = []
+                    prev_user = None
+                    if selection:
+                        selected_entries, prev_user = selection
+                        for entry in selected_entries:
+                            selected_link = build_product_link(entry.get("product") or {}, entry.get("variant") or {})
+                            if selected_link:
+                                selected_links.append(selected_link)
+                        if selected_links:
+                            product_links = merge_product_links(product_links, selected_links)
+                    if prev_user and selected_links and should_add_to_cart(prev_user):
+                        qty = parse_quantity(prev_user)
+                        if len(selected_links) >= 2 and wants_multiple_distinct_items(request.message):
+                            qty = 1
+                        cart_actions = build_cart_actions_from_links(selected_links, qty)
+                    else:
+                        cart_actions = build_cart_actions(
+                            request.message,
+                            product_links,
+                            catalog.get("products", [])
+                        )
+
+                if not cart_actions and pending_response is None and should_add_to_cart(request.message):
+                    if len(product_links) > 1:
+                        candidates, _ = pick_cart_candidates(
+                            request.message,
+                            product_links,
+                            catalog.get("products", [])
+                        )
+                        if not candidates:
+                            pending_qty = parse_quantity(request.message)
+                            if len(product_links) >= 2 and wants_multiple_distinct_items(request.message):
+                                pending_qty = 1
+                            pending_response = PendingChoice(
+                                type="choose_for_cart",
+                                options=product_links,
+                                quantity=pending_qty
+                            )
+
+                if (
+                    not cart_actions
+                    and pending_response is None
+                    and product_links
+                    and should_add_to_cart(request.message)
+                ):
+                    qty = parse_quantity(request.message) or 1
+                    if len(product_links) >= 2 and wants_multiple_distinct_items(request.message):
+                        qty = 1
+                    cart_actions = build_cart_actions_from_links(product_links, qty)
+
+                cart_actions = enforce_single_ordinal_cart_actions(request.message, cart_actions)
+                if (
+                    cart_actions
+                    and pending_response is None
+                    and request.pending is None
+                    and not should_add_to_cart(request.message)
+                ):
+                    logger.warning("Clearing cart actions without explicit user consent")
+                    cart_actions = []
+                confirmation = build_cart_confirmation_message(cart_actions)
+                if confirmation:
+                    cleaned_full = confirmation
+
+                response_products = product_links
+                if pending_response and pending_response.options:
+                    response_products = pending_response.options
+                if not should_include_products(
+                    request.message,
+                    cleaned_full,
+                    response_products,
+                    pending_response,
+                    cart_actions
+                ):
+                    response_products = []
+                
+                yield _sse_event({
+                    "event": "final",
+                    "message": cleaned_full,
+                    "model": OLLAMA_MODEL,
+                    "in_stock_products": catalog.get("total", 0),
+                    "validated": is_valid,
+                    "products": [p.model_dump() for p in response_products],
+                    "cart_actions": [a.model_dump() for a in cart_actions],
+                    "pending": pending_response.model_dump() if pending_response else None
+                })
+            
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+        
+        # Get response from Ollama
+        response_text = await call_ollama(messages)
+        response_products = None
+        
+        # Validate response doesn't hallucinate products
+        is_valid, invalid_variants = validate_response_variant_keys(response_text, allowed_variant_keys)
+        
+        if not is_valid:
+            # Retry once with correction
+            logger.info(f"Invalid variant keys detected: {invalid_variants}, retrying with correction")
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append({
+                "role": "user",
+                "content": f"WARNING: You mentioned variant keys that are NOT in the ALLOWED_VARIANTS list: {invalid_variants}. You MUST use the [V:productId:combinationId] format and ONLY use variant keys from the ALLOWED_VARIANTS list. Please provide recommendations using ONLY products from the current catalog."
+            })
+            
+            response_text = await call_ollama(messages)
+            is_valid, invalid_variants = validate_response_variant_keys(response_text, allowed_variant_keys)
+        
+        if not response_text:
+            response_text, response_products = get_safe_fallback(catalog)
+
+        extracted_variant_keys = []
+        product_links: List[ProductLink] = []
+
+        if response_products is None:
+            extracted_variant_keys = extract_variant_keys_in_order(response_text)
+            product_links = build_product_links_from_variant_keys(
+                extracted_variant_keys,
+                catalog.get("products", []),
+                allowed_variant_keys
+            )
+        else:
+            for entry in response_products:
+                product = entry.get("product") or {}
+                variant = entry.get("variant") or {}
+                link = build_product_link(product, variant)
+                if link:
+                    product_links.append(link)
+
+        inferred_links: List[ProductLink] = []
+        if response_products is None and not product_links:
+            inferred_links = infer_product_links_from_text(
+                response_text,
+                catalog.get("products", [])
+            )
+            if inferred_links:
+                product_links = inferred_links
+
+        needs_fallback = False
+        if response_products is None:
+            if not is_valid:
+                if not inferred_links:
+                    needs_fallback = True
+            elif extracted_variant_keys and not product_links:
+                needs_fallback = True
+            elif (not extracted_variant_keys) and (not product_links) and looks_like_recommendation(response_text):
+                needs_fallback = True
+
+        if needs_fallback:
+            logger.error(f"Validation failed after retry, invalid variant keys: {invalid_variants}")
+            response_text, response_products = get_safe_fallback(catalog)
+            extracted_variant_keys = []
+            product_links = []
+            for entry in (response_products or []):
+                product = entry.get("product") or {}
+                variant = entry.get("variant") or {}
+                link = build_product_link(product, variant)
+                if link:
+                    product_links.append(link)
+            is_valid = True  # Fallback is always valid
+        
+        # Remove variant tags from user-facing text
+        response_text = strip_variant_tags(response_text, extracted_variant_keys)
+
+        pending_response = None
+        cart_actions: List[CartAction] = []
+
+        pending_actions, pending_response = resolve_pending_choice(
+            request.message,
+            request.pending,
+            catalog.get("products", [])
+        )
+        if pending_actions:
+            cart_actions = pending_actions
+        elif pending_response:
+            cart_actions = []
+        else:
+            selection = await resolve_selection_from_history(
+                request.message,
+                request.history,
+                catalog.get("products", [])
+            )
+            selected_links: List[ProductLink] = []
+            prev_user = None
+            if selection:
+                selected_entries, prev_user = selection
+                for entry in selected_entries:
+                    selected_link = build_product_link(entry.get("product") or {}, entry.get("variant") or {})
+                    if selected_link:
+                        selected_links.append(selected_link)
+                if selected_links:
+                    product_links = merge_product_links(product_links, selected_links)
+            if prev_user and selected_links and should_add_to_cart(prev_user):
+                qty = parse_quantity(prev_user)
+                if len(selected_links) >= 2 and wants_multiple_distinct_items(request.message):
+                    qty = 1
+                cart_actions = build_cart_actions_from_links(selected_links, qty)
+            else:
+                cart_actions = build_cart_actions(
+                    request.message,
+                    product_links,
+                    catalog.get("products", [])
+                )
+
+        if not cart_actions and pending_response is None and should_add_to_cart(request.message):
+            if len(product_links) > 1:
+                candidates, _ = pick_cart_candidates(
+                    request.message,
+                    product_links,
+                    catalog.get("products", [])
+                )
+                if not candidates:
+                    pending_qty = parse_quantity(request.message)
+                    if len(product_links) >= 2 and wants_multiple_distinct_items(request.message):
+                        pending_qty = 1
+                    pending_response = PendingChoice(
+                        type="choose_for_cart",
+                        options=product_links,
+                        quantity=pending_qty
+                    )
+
+        if (
+            not cart_actions
+            and pending_response is None
+            and product_links
+            and should_add_to_cart(request.message)
+        ):
+            qty = parse_quantity(request.message) or 1
+            if len(product_links) >= 2 and wants_multiple_distinct_items(request.message):
+                qty = 1
+            cart_actions = build_cart_actions_from_links(product_links, qty)
+
+        cart_actions = enforce_single_ordinal_cart_actions(request.message, cart_actions)
+        if (
+            cart_actions
+            and pending_response is None
+            and request.pending is None
+            and not should_add_to_cart(request.message)
+        ):
+            logger.warning("Clearing cart actions without explicit user consent")
+            cart_actions = []
+        confirmation = build_cart_confirmation_message(cart_actions)
+        if confirmation:
+            response_text = confirmation
+
+        response_products = product_links
+        if pending_response and pending_response.options:
+            response_products = pending_response.options
+        if not should_include_products(
+            request.message,
+            response_text,
+            response_products,
+            pending_response,
+            cart_actions
+        ):
+            response_products = []
+        
+        return ChatResponse(
+            message=response_text,
+            model=OLLAMA_MODEL,
+            in_stock_products=catalog.get("total", 0),
+            validated=is_valid,
+            products=response_products,
+            cart_actions=cart_actions,
+            pending=pending_response
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        # Don't leak internal details
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/clear-cache")
+async def clear_cache(authorization: Optional[str] = Header(None)):
+    """Clear the catalog cache and force refresh (admin endpoint)."""
+    if API_KEY and authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    try:
+        await mcp_client.get_catalog(force_refresh=True)
+        return {"status": "cache refreshed"}
+    except Exception as e:
+        logger.error(f"Cache refresh failed: {e}")
+        raise HTTPException(status_code=500, detail="Cache refresh failed")
+
+
+# Error handlers
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected errors gracefully without leaking internals."""
+    logger.error(f"Unexpected error on {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}  # No detail leak
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting server on 0.0.0.0:{PORT}")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info"
+    )
+
+
+ensure i can host this on vercel so all serverless functions. Ill be using ollama to do it and itll be hosted as one project on vercel so ill only call the /chat endpoint which connect sto my agent and my agent will talk to my server in the backend.

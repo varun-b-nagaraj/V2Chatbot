@@ -1,0 +1,15 @@
+[
+  {
+    "q": "Do you offer local pickup?",
+    "a": "Yes. Local pickup is available during store hours. Orders are usually ready within 2 business hours unless the product page says otherwise."
+  },
+  {
+    "q": "How do I check if an item is in stock?",
+    "a": "Inventory is synced from the E-Series backend. If the item or variant shows in stock, it is currently available to sell."
+  },
+  {
+    "q": "What is your return policy?",
+    "a": "Unused items can be returned within 30 days with the original receipt. Clearance items and special orders are final sale."
+  }
+]
+

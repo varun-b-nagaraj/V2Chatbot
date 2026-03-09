@@ -1,0 +1,18 @@
+{
+  "store_name": "Example E-Series Store",
+  "support_email": "support@example.com",
+  "support_phone": "+1-555-0100",
+  "pickup_policy": "Pickup orders are typically ready within 2 business hours. Bring your order confirmation and photo ID.",
+  "shipping_policy": "Standard shipping takes 3 to 5 business days. Expedited options are available at checkout.",
+  "return_policy": "Returns accepted within 30 days for unused items in original packaging unless marked final sale.",
+  "hours": {
+    "monday": "9:00 AM - 6:00 PM",
+    "tuesday": "9:00 AM - 6:00 PM",
+    "wednesday": "9:00 AM - 6:00 PM",
+    "thursday": "9:00 AM - 6:00 PM",
+    "friday": "9:00 AM - 6:00 PM",
+    "saturday": "10:00 AM - 4:00 PM",
+    "sunday": "Closed"
+  }
+}
+
