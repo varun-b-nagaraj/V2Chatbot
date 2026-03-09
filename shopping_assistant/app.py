@@ -16,8 +16,7 @@ import httpx
 from dotenv import load_dotenv
 from fastmcp import Client as FastMCPClient
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -26,7 +25,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 PORT = int(os.getenv("PORT", "8000"))
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 MCP_URL = os.getenv("MCP_URL", "").strip()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud").strip()
@@ -669,22 +667,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if ALLOWED_ORIGINS == ["*"]:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+def _apply_cors_headers(response: Response) -> Response:
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+@app.middleware("http")
+async def allow_all_cors(request: Request, call_next):
+    if request.method.upper() == "OPTIONS":
+        return _apply_cors_headers(Response(status_code=204))
+
+    response = await call_next(request)
+    return _apply_cors_headers(response)
 
 
 async def call_ollama(messages: list[dict[str, str]]) -> str:
@@ -1124,4 +1121,4 @@ async def chat_tools(request: ChatRequest, authorization: str | None = Header(No
 @app.exception_handler(Exception)
 async def handle_exception(request: Request, exc: Exception):
     logger.error("Unhandled error on %s: %s", request.url.path, exc, exc_info=True)
-    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+    return _apply_cors_headers(JSONResponse(status_code=500, content={"error": "Internal server error"}))

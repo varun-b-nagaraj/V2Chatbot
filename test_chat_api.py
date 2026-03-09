@@ -7,6 +7,18 @@ from shopping_assistant import app as assistant_module
 client = TestClient(app)
 
 
+def test_options_preflight_returns_cors_headers() -> None:
+    response = client.options(
+        "/chat",
+        headers={
+            "Origin": "https://rrhscoop.roundrockisd.org",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 204
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
 def test_health_route_with_mocked_catalog(monkeypatch) -> None:
     async def fake_get_catalog_for_query(query: str, limit: int = 24):
         return {"products": [], "total": 0, "last_updated": 0}
