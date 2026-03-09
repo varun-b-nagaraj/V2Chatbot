@@ -66,6 +66,108 @@ def test_chat_route_with_mocked_dependencies(monkeypatch) -> None:
     assert "[V:" not in body["message"]
 
 
+def test_chat_route_supports_remove_from_cart(monkeypatch) -> None:
+    catalog = {
+        "products": [
+            {
+                "id": 101,
+                "name": "Protein Shake",
+                "url": "https://example.com/protein-shake",
+                "variants": [
+                    {
+                        "variantKey": "101:1",
+                        "combinationId": 1,
+                        "label": "Chocolate",
+                        "price": 4.99,
+                        "effectiveSku": "SHAKE-CHOC",
+                        "in_stock": True,
+                        "options": [{"name": "Flavor", "value": "Chocolate"}],
+                    }
+                ],
+            }
+        ],
+        "total": 1,
+        "last_updated": 0,
+    }
+
+    async def fake_get_catalog_for_query(query: str, limit: int = 24):
+        return catalog
+
+    async def fake_call_ollama(messages):
+        return "[V:101:1] Protein Shake - Chocolate - $4.99"
+
+    monkeypatch.setattr(assistant_module.mcp_client, "get_catalog_for_query", fake_get_catalog_for_query)
+    monkeypatch.setattr(assistant_module, "call_ollama", fake_call_ollama)
+
+    headers = {}
+    if assistant_module.API_KEY:
+        headers["Authorization"] = f"Bearer {assistant_module.API_KEY}"
+
+    response = client.post(
+        "/chat",
+        json={"message": "Remove the protein shake from my cart"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == "Removed from your cart."
+    assert body["cart_actions"][0]["quantity"] == -1
+
+
+def test_chat_route_supports_pending_remove_selection(monkeypatch) -> None:
+    catalog = {"products": [], "total": 0, "last_updated": 0}
+
+    async def fake_get_catalog_for_query(query: str, limit: int = 24):
+        return catalog
+
+    monkeypatch.setattr(assistant_module.mcp_client, "get_catalog_for_query", fake_get_catalog_for_query)
+
+    headers = {}
+    if assistant_module.API_KEY:
+        headers["Authorization"] = f"Bearer {assistant_module.API_KEY}"
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "the first one",
+            "pending": {
+                "type": "choose_for_cart",
+                "quantity": -1,
+                "options": [
+                    {
+                        "id": 101,
+                        "name": "Protein Shake",
+                        "combinationId": 1,
+                        "variantKey": "101:1",
+                        "variantLabel": "Chocolate",
+                        "price": 4.99,
+                        "sku": "SHAKE-CHOC",
+                        "url": "https://example.com/protein-shake",
+                        "selectedOptions": [{"name": "Flavor", "value": "Chocolate"}]
+                    },
+                    {
+                        "id": 101,
+                        "name": "Protein Shake",
+                        "combinationId": 2,
+                        "variantKey": "101:2",
+                        "variantLabel": "Vanilla",
+                        "price": 4.99,
+                        "sku": "SHAKE-VAN",
+                        "url": "https://example.com/protein-shake",
+                        "selectedOptions": [{"name": "Flavor", "value": "Vanilla"}]
+                    }
+                ]
+            }
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == "Removed from your cart."
+    assert body["cart_actions"][0]["quantity"] == -1
+    assert body["cart_actions"][0]["combinationId"] == 1
+
+
 def test_chat_route_returns_graceful_response_when_catalog_is_down(monkeypatch) -> None:
     async def fake_get_catalog_for_query(query: str, limit: int = 24):
         raise assistant_module.CatalogUnavailableError("down")

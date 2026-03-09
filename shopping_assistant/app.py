@@ -157,7 +157,7 @@ class ProductLink(BaseModel):
 class PendingChoice(BaseModel):
     type: str = Field(..., pattern="^choose_for_cart$")
     options: list[ProductLink] = Field(default_factory=list)
-    quantity: int = Field(1, ge=1, le=20)
+    quantity: int = Field(1, ge=-20, le=20)
 
 
 class ChatRequest(BaseModel):
@@ -257,6 +257,25 @@ def _should_add_to_cart(text: str) -> bool:
     return bool(re.search(r"\b(add|put|throw)\b", value)) and ("cart" in value or "bag" in value or value.startswith("add "))
 
 
+def _should_remove_from_cart(text: str) -> bool:
+    value = (text or "").lower()
+    return bool(
+        re.search(r"\b(remove|delete|take)\b", value)
+        and ("cart" in value or "bag" in value or "out" in value)
+    )
+
+
+def _cart_quantity_delta(text: str) -> int:
+    quantity = _parse_quantity(text)
+    if _should_remove_from_cart(text):
+        return -quantity
+    return quantity
+
+
+def _is_cart_update_request(text: str) -> bool:
+    return _should_add_to_cart(text) or _should_remove_from_cart(text)
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     match = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
     if not match:
@@ -325,8 +344,8 @@ def _safe_fallback(catalog: dict[str, Any]) -> tuple[str, list[ProductLink]]:
 
 
 def _inventory_unavailable_message(user_text: str) -> str:
-    if _should_add_to_cart(user_text):
-        return "I’m having trouble reaching live inventory right now, so I can’t safely add that yet. Try again in a moment."
+    if _is_cart_update_request(user_text):
+        return "I’m having trouble reaching live inventory right now, so I can’t safely update your cart yet. Try again in a moment."
     return "I’m having trouble reaching live inventory right now. Try again in a moment and I’ll pull live options for you."
 
 
@@ -760,27 +779,12 @@ def _validate_variant_keys(text: str, products: list[dict[str, Any]]) -> tuple[b
 
 
 def _build_cart_actions(request_text: str, product_links: list[ProductLink]) -> list[CartAction]:
-    if not _should_add_to_cart(request_text) or not product_links:
+    if not _is_cart_update_request(request_text) or not product_links:
         return []
-    quantity = _parse_quantity(request_text)
-    if len(product_links) == 1:
-        chosen = [product_links[0]]
-    else:
-        chosen: list[ProductLink] = []
-        lowered = request_text.lower()
-        ordinal = None
-        for word, idx in ORDINAL_WORDS.items():
-            if re.search(rf"\b{word}\b", lowered):
-                ordinal = idx
-                break
-        if ordinal is not None and ordinal < len(product_links):
-            chosen = [product_links[ordinal]]
-        else:
-            for link in product_links:
-                if link.variantLabel.lower() in lowered or link.name.lower() in lowered:
-                    chosen.append(link)
-            if len(chosen) != 1:
-                return []
+    quantity = _cart_quantity_delta(request_text)
+    chosen = _select_cart_candidates(request_text, product_links)
+    if not chosen:
+        return []
     return [
         CartAction(
             type="cart.add",
@@ -795,9 +799,52 @@ def _build_cart_actions(request_text: str, product_links: list[ProductLink]) -> 
 
 
 def _build_pending_choice(request_text: str, product_links: list[ProductLink]) -> PendingChoice | None:
-    if not _should_add_to_cart(request_text) or len(product_links) <= 1:
+    if not _is_cart_update_request(request_text) or len(product_links) <= 1:
         return None
-    return PendingChoice(type="choose_for_cart", options=product_links[:4], quantity=_parse_quantity(request_text))
+    return PendingChoice(type="choose_for_cart", options=product_links[:4], quantity=_cart_quantity_delta(request_text))
+
+
+def _select_cart_candidates(request_text: str, product_links: list[ProductLink]) -> list[ProductLink]:
+    if not product_links:
+        return []
+    if len(product_links) == 1:
+        return [product_links[0]]
+
+    lowered = request_text.lower()
+    ordinal = None
+    for word, idx in ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", lowered):
+            ordinal = idx
+            break
+    if ordinal is not None and ordinal < len(product_links):
+        return [product_links[ordinal]]
+
+    chosen = [
+        link
+        for link in product_links
+        if link.variantLabel.lower() in lowered or link.name.lower() in lowered
+    ]
+    return chosen if len(chosen) == 1 else []
+
+
+def _build_cart_actions_from_pending(request_text: str, pending: PendingChoice | None) -> list[CartAction]:
+    if not pending or not pending.options:
+        return []
+    chosen = _select_cart_candidates(request_text, pending.options)
+    if not chosen:
+        return []
+    quantity = pending.quantity or 1
+    return [
+        CartAction(
+            type="cart.add",
+            productId=link.id,
+            combinationId=link.combinationId,
+            quantity=quantity,
+            sku=link.sku,
+            options=link.selectedOptions,
+        )
+        for link in chosen
+    ]
 
 
 def _sse_event(payload: dict[str, Any]) -> str:
@@ -932,6 +979,28 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    if request.pending and request.pending.options:
+        pending_actions = _build_cart_actions_from_pending(request.message, request.pending)
+        if pending_actions:
+            total_delta = sum(action.quantity for action in pending_actions)
+            if total_delta == -1:
+                message = "Removed from your cart."
+            elif total_delta < 0:
+                message = "Removed those from your cart."
+            elif total_delta == 1:
+                message = "Added to your cart."
+            else:
+                message = "Added those to your cart."
+            return ChatResponse(
+                message=message,
+                model=OLLAMA_MODEL,
+                in_stock_products=len(request.pending.options),
+                validated=True,
+                products=[],
+                cart_actions=pending_actions,
+                pending=None,
+            )
+
     try:
         catalog = await mcp_client.get_catalog_for_query(request.message)
     except CatalogUnavailableError:
@@ -998,7 +1067,7 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
         pending = None
         cart_actions: list[CartAction] = []
         if request.pending and request.pending.options:
-            cart_actions = _build_cart_actions(request.message, request.pending.options)
+            cart_actions = _build_cart_actions_from_pending(request.message, request.pending)
         if not cart_actions:
             cart_actions = _build_cart_actions(request.message, product_links)
         if not cart_actions:
@@ -1006,7 +1075,15 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
 
         cleaned = _strip_variant_tags(raw_text)
         if cart_actions:
-            cleaned = "Added to your cart." if sum(action.quantity for action in cart_actions) == 1 else "Added those to your cart."
+            total_delta = sum(action.quantity for action in cart_actions)
+            if total_delta == -1:
+                cleaned = "Removed from your cart."
+            elif total_delta < 0:
+                cleaned = "Removed those from your cart."
+            elif total_delta == 1:
+                cleaned = "Added to your cart."
+            else:
+                cleaned = "Added those to your cart."
 
         response_products = pending.options if pending else product_links
         if cart_actions:
