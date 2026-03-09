@@ -53,14 +53,10 @@ def test_chat_route_with_mocked_dependencies(monkeypatch) -> None:
         "last_updated": 0,
     }
 
-    async def fake_get_catalog_for_query(query: str, limit: int = 24):
-        return catalog
+    async def fake_tool_roundtrip(request):
+        return "[V:101:1] Protein Shake - Chocolate - $4.99\nGreat post-workout pick.", [], catalog
 
-    async def fake_call_ollama(messages):
-        return "[V:101:1] Protein Shake - Chocolate - $4.99\nGreat post-workout pick."
-
-    monkeypatch.setattr(assistant_module.mcp_client, "get_catalog_for_query", fake_get_catalog_for_query)
-    monkeypatch.setattr(assistant_module, "call_ollama", fake_call_ollama)
+    monkeypatch.setattr(assistant_module, "_run_llm_tool_roundtrip", fake_tool_roundtrip)
 
     headers = {}
     if assistant_module.API_KEY:
@@ -102,14 +98,10 @@ def test_chat_route_supports_remove_from_cart(monkeypatch) -> None:
         "last_updated": 0,
     }
 
-    async def fake_get_catalog_for_query(query: str, limit: int = 24):
-        return catalog
+    async def fake_tool_roundtrip(request):
+        return "[V:101:1] Protein Shake - Chocolate - $4.99", [], catalog
 
-    async def fake_call_ollama(messages):
-        return "[V:101:1] Protein Shake - Chocolate - $4.99"
-
-    monkeypatch.setattr(assistant_module.mcp_client, "get_catalog_for_query", fake_get_catalog_for_query)
-    monkeypatch.setattr(assistant_module, "call_ollama", fake_call_ollama)
+    monkeypatch.setattr(assistant_module, "_run_llm_tool_roundtrip", fake_tool_roundtrip)
 
     headers = {}
     if assistant_module.API_KEY:
@@ -181,10 +173,10 @@ def test_chat_route_supports_pending_remove_selection(monkeypatch) -> None:
 
 
 def test_chat_route_returns_graceful_response_when_catalog_is_down(monkeypatch) -> None:
-    async def fake_get_catalog_for_query(query: str, limit: int = 24):
+    async def fake_tool_roundtrip(request):
         raise assistant_module.CatalogUnavailableError("down")
 
-    monkeypatch.setattr(assistant_module.mcp_client, "get_catalog_for_query", fake_get_catalog_for_query)
+    monkeypatch.setattr(assistant_module, "_run_llm_tool_roundtrip", fake_tool_roundtrip)
 
     headers = {}
     if assistant_module.API_KEY:
@@ -195,21 +187,14 @@ def test_chat_route_returns_graceful_response_when_catalog_is_down(monkeypatch) 
         json={"message": "show me chips"},
         headers=headers,
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["validated"] is False
-    assert body["products"] == []
+    assert response.status_code == 503
 
 
 def test_chat_route_handles_mcp_session_open_failure(monkeypatch) -> None:
-    class BrokenProtocolClient:
-        async def __aenter__(self):
-            raise RuntimeError("session open failed")
+    async def fake_tool_roundtrip(request):
+        raise RuntimeError("session open failed")
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-    monkeypatch.setattr(assistant_module.mcp_client, "_new_protocol_client", lambda: BrokenProtocolClient())
+    monkeypatch.setattr(assistant_module, "_run_llm_tool_roundtrip", fake_tool_roundtrip)
 
     headers = {}
     if assistant_module.API_KEY:
@@ -220,9 +205,7 @@ def test_chat_route_handles_mcp_session_open_failure(monkeypatch) -> None:
         json={"message": "show me chips"},
         headers=headers,
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["validated"] is False
+    assert response.status_code == 502
 
 
 def test_chat_tools_executes_llm_requested_tool(monkeypatch) -> None:

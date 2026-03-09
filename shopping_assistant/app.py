@@ -76,6 +76,10 @@ Rules:
 - Use `store_info_get` and `faq_search` for policies and store operations.
 - After you receive tool results, answer clearly and briefly.
 - If a tool fails, explain that live inventory is temporarily unavailable instead of making anything up.
+- If you mention a specific sellable option, include exactly one internal tag in this format: [V:productId:combinationId]
+- Use those tags only for real in-stock options returned by the tools.
+- If a product has multiple options and the shopper wants to add or remove it, ask one short clarification question.
+- Keep responses short and specific.
 """
 
 SELECTION_SYSTEM_PROMPT = """
@@ -872,7 +876,71 @@ def _normalize_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {}
 
 
-async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
+def _catalog_from_tool_traces(traces: list[ToolCallTrace]) -> dict[str, Any]:
+    product_index: dict[int, dict[str, Any]] = {}
+
+    def ensure_product(product_id: int, name: str | None = None) -> dict[str, Any]:
+        existing = product_index.get(product_id)
+        if existing is None:
+            existing = {
+                "id": product_id,
+                "name": name or f"Product {product_id}",
+                "url": "",
+                "options": [],
+                "variants": [],
+            }
+            product_index[product_id] = existing
+        elif name and not existing.get("name"):
+            existing["name"] = name
+        return existing
+
+    for trace in traces:
+        if not trace.ok:
+            continue
+        result = trace.result or {}
+        if trace.name == "catalog_search":
+            items = result.get("items", [])
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    product_id = int(item.get("id") or 0)
+                    if product_id <= 0:
+                        continue
+                    product = ensure_product(product_id, item.get("name"))
+                    for key, value in item.items():
+                        if key != "variants":
+                            product[key] = value
+                    product.setdefault("variants", [])
+        elif trace.name == "product_get":
+            product_data = result.get("product")
+            if isinstance(product_data, dict):
+                product_id = int(product_data.get("id") or 0)
+                if product_id > 0:
+                    product = ensure_product(product_id, product_data.get("name"))
+                    product.update(product_data)
+                    product.setdefault("variants", product_data.get("variants") or [])
+        elif trace.name == "product_variants_get":
+            product_id = int(result.get("product_id") or 0)
+            if product_id > 0:
+                product = ensure_product(product_id, result.get("product"))
+                if result.get("product"):
+                    product["name"] = result.get("product")
+                if isinstance(result.get("options"), list):
+                    product["options"] = result.get("options")
+                if isinstance(result.get("variants"), list):
+                    product["variants"] = result.get("variants")
+
+    products = list(product_index.values())
+    return {
+        "products": products,
+        "total": len(products),
+    }
+
+
+async def _run_llm_tool_roundtrip(
+    request: ChatRequest,
+) -> tuple[str, list[ToolCallTrace], dict[str, Any]]:
     messages: list[dict[str, Any]] = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}]
     for item in request.history or []:
         messages.append({"role": item.role, "content": item.content})
@@ -887,16 +955,11 @@ async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
             response = await call_ollama_message(messages, tools=tool_schemas)
             message = response.get("message", {})
             if not isinstance(message, dict):
-                return ToolChatResponse(message="", model=OLLAMA_MODEL, tool_calls=traces, rounds=round_num)
+                return "", traces, _catalog_from_tool_traces(traces)
 
             tool_calls = message.get("tool_calls") or []
             if not isinstance(tool_calls, list) or not tool_calls:
-                return ToolChatResponse(
-                    message=message.get("content", "") or "",
-                    model=OLLAMA_MODEL,
-                    tool_calls=traces,
-                    rounds=round_num,
-                )
+                return message.get("content", "") or "", traces, _catalog_from_tool_traces(traces)
 
             messages.append(message)
             for tool_call in tool_calls:
@@ -930,11 +993,20 @@ async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
 
     final_response = await call_ollama_message(messages)
     final_message = final_response.get("message", {}) if isinstance(final_response, dict) else {}
+    return (
+        final_message.get("content", "") if isinstance(final_message, dict) else "",
+        traces,
+        _catalog_from_tool_traces(traces),
+    )
+
+
+async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
+    message, traces, _ = await _run_llm_tool_roundtrip(request)
     return ToolChatResponse(
-        message=final_message.get("content", "") if isinstance(final_message, dict) else "",
+        message=message,
         model=OLLAMA_MODEL,
         tool_calls=traces,
-        rounds=max_rounds,
+        rounds=min(4, max(1, len(traces) or 1)),
     )
 
 
@@ -1013,65 +1085,24 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
             )
 
     try:
-        catalog = await mcp_client.get_catalog_for_query(request.message)
+        raw_text, _traces, catalog = await _run_llm_tool_roundtrip(request)
     except CatalogUnavailableError:
-        response = ChatResponse(
-            message=_inventory_unavailable_message(request.message),
-            model=OLLAMA_MODEL,
-            in_stock_products=0,
-            validated=False,
-            products=[],
-            cart_actions=[],
-            pending=None,
-        )
-        if request.stream:
-            async def unavailable_stream():
-                yield _sse_event({"event": "final", **response.model_dump()})
-
-            return StreamingResponse(unavailable_stream(), media_type="text/event-stream")
-        return response
+        raise HTTPException(status_code=503, detail="Inventory backend unavailable")
+    except Exception as exc:
+        logger.error("Tool chat failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="Assistant backend error") from exc
 
     products = catalog.get("products", [])
-    catalog_prompt = _format_catalog_for_prompt(catalog)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": catalog_prompt},
-    ]
-    for item in request.history or []:
-        messages.append({"role": item.role, "content": item.content})
-    messages.append({"role": "user", "content": request.message})
 
-    async def finalize_response(raw_text: str) -> ChatResponse:
+    def finalize_response(raw_text: str) -> ChatResponse:
         valid, invalid_keys, product_links = _validate_variant_keys(raw_text, products)
-        if not valid:
-            correction = (
-                "You used invalid variant tags. Use only exact [V:productId:combinationId] tags from ALLOWED_VARIANTS. "
-                f"Invalid tags: {invalid_keys}."
-            )
-            retry_messages = messages + [{"role": "assistant", "content": raw_text}, {"role": "user", "content": correction}]
-            raw_text_retry = await call_ollama(retry_messages)
-            valid, invalid_keys, product_links = _validate_variant_keys(raw_text_retry, products)
-            raw_text = raw_text_retry
-
         if not raw_text:
-            fallback_text, fallback_links = _safe_fallback(catalog)
             return ChatResponse(
-                message=fallback_text,
+                message="I couldn't complete that request.",
                 model=OLLAMA_MODEL,
                 in_stock_products=catalog.get("total", 0),
-                validated=True,
-                products=fallback_links,
-                cart_actions=[],
-            )
-
-        if not valid and _looks_like_recommendation(raw_text):
-            fallback_text, fallback_links = _safe_fallback(catalog)
-            return ChatResponse(
-                message=fallback_text,
-                model=OLLAMA_MODEL,
-                in_stock_products=catalog.get("total", 0),
-                validated=True,
-                products=fallback_links,
+                validated=False,
+                products=[],
                 cart_actions=[],
             )
 
@@ -1111,18 +1142,14 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
         )
 
     if request.stream:
+        final = finalize_response(raw_text)
+
         async def event_generator():
-            parts: list[str] = []
-            async for chunk in call_ollama_stream(messages):
-                parts.append(chunk)
-                yield _sse_event({"event": "delta", "content": _strip_variant_tags(chunk)})
-            final = await finalize_response("".join(parts))
             yield _sse_event({"event": "final", **final.model_dump()})
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    raw_text = await call_ollama(messages)
-    return await finalize_response(raw_text)
+    return finalize_response(raw_text)
 
 
 @app.post("/chat-tools", response_model=ToolChatResponse)
