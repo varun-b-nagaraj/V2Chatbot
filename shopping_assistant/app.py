@@ -35,6 +35,7 @@ OLLAMA_FIRST_TOKEN_TIMEOUT_MS = int(os.getenv("OLLAMA_FIRST_TOKEN_TIMEOUT_MS", "
 API_KEY = os.getenv("API_KEY", "").strip()
 MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.15"))
 CATALOG_CACHE_TTL_SEC = int(os.getenv("CATALOG_CACHE_TTL_SEC", "300"))
+CHAT_CATALOG_LIMIT = int(os.getenv("CHAT_CATALOG_LIMIT", "24"))
 
 SYSTEM_PROMPT = """
 You are a concise, high-conversion shopping assistant for an online store.
@@ -76,6 +77,49 @@ ORDINAL_WORDS = {
     "fifth": 4,
     "sixth": 5,
 }
+SEARCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "best",
+    "buy",
+    "cart",
+    "drink",
+    "for",
+    "get",
+    "good",
+    "have",
+    "i",
+    "in",
+    "is",
+    "item",
+    "items",
+    "like",
+    "me",
+    "my",
+    "need",
+    "of",
+    "on",
+    "or",
+    "recommend",
+    "show",
+    "something",
+    "some",
+    "snack",
+    "that",
+    "the",
+    "these",
+    "those",
+    "to",
+    "want",
+    "what",
+    "with",
+}
+
+
+class CatalogUnavailableError(RuntimeError):
+    pass
 
 
 class Message(BaseModel):
@@ -250,6 +294,12 @@ def _safe_fallback(catalog: dict[str, Any]) -> tuple[str, list[ProductLink]]:
     return "\n".join(lines), links
 
 
+def _inventory_unavailable_message(user_text: str) -> str:
+    if _should_add_to_cart(user_text):
+        return "I’m having trouble reaching live inventory right now, so I can’t safely add that yet. Try again in a moment."
+    return "I’m having trouble reaching live inventory right now. Try again in a moment and I’ll pull live options for you."
+
+
 def _format_catalog_for_prompt(catalog: dict[str, Any]) -> str:
     products = catalog.get("products", [])
     if not products:
@@ -278,10 +328,31 @@ class MCPClient:
         self.catalog_cache: dict[str, Any] | None = None
         self.cache_timestamp = 0.0
         self.cache_ttl = CATALOG_CACHE_TTL_SEC
-        self.timeout_sec = float(os.getenv("MCP_TIMEOUT_SEC", "15"))
+        self.search_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.timeout_sec = float(os.getenv("MCP_TIMEOUT_SEC", "30"))
         self.max_retries = int(os.getenv("MCP_MAX_RETRIES", "3"))
         self.retry_base_sec = float(os.getenv("MCP_RETRY_BASE_SEC", "0.4"))
         self.lock = asyncio.Lock()
+        self.search_lock = asyncio.Lock()
+
+    def _cache_valid(self, timestamp: float) -> bool:
+        return (time.time() - timestamp) < self.cache_ttl
+
+    def _get_search_cache(self, key: str) -> dict[str, Any] | None:
+        cached = self.search_cache.get(key)
+        if not cached:
+            return None
+        timestamp, value = cached
+        if self._cache_valid(timestamp):
+            return value
+        self.search_cache.pop(key, None)
+        return None
+
+    @staticmethod
+    def _keyword_from_query(query: str | None) -> str:
+        tokens = re.findall(r"[a-z0-9]+", (query or "").lower())
+        filtered = [token for token in tokens if len(token) > 1 and token not in SEARCH_STOPWORDS]
+        return " ".join(filtered[:6]).strip()
 
     async def _call_tool_with_retry(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not MCP_URL:
@@ -301,7 +372,14 @@ class MCPClient:
                 raise RuntimeError(f"Unexpected {tool_name} payload")
             except Exception as exc:
                 last_error = exc
-                logger.warning("MCP %s failed attempt %s/%s: %s", tool_name, attempt, self.max_retries, exc)
+                logger.warning(
+                    "MCP %s failed attempt %s/%s: %s: %s",
+                    tool_name,
+                    attempt,
+                    self.max_retries,
+                    type(exc).__name__,
+                    exc,
+                )
                 if attempt < self.max_retries:
                     delay = self.retry_base_sec * (2 ** (attempt - 1)) + random.uniform(0, self.retry_base_sec)
                     await asyncio.sleep(delay)
@@ -338,53 +416,104 @@ class MCPClient:
 
     async def get_catalog(self, force_refresh: bool = False) -> dict[str, Any]:
         now = time.time()
-        if not force_refresh and self.catalog_cache and (now - self.cache_timestamp) < self.cache_ttl:
+        if not force_refresh and self.catalog_cache and self._cache_valid(self.cache_timestamp):
             return self.catalog_cache
 
         async with self.lock:
             now = time.time()
-            if not force_refresh and self.catalog_cache and (now - self.cache_timestamp) < self.cache_ttl:
+            if not force_refresh and self.catalog_cache and self._cache_valid(self.cache_timestamp):
                 return self.catalog_cache
 
-            all_products: list[dict[str, Any]] = []
-            offset = 0
-            limit = 100
+            try:
+                all_products: list[dict[str, Any]] = []
+                offset = 0
+                limit = 100
 
-            while True:
-                data = await self._call_tool_with_retry("catalog_search", {"limit": limit, "offset": offset})
-                items = data.get("items", [])
-                if not isinstance(items, list):
-                    break
-                enabled_batch = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
-                all_products.extend(enabled_batch)
-                if len(items) < limit or offset > 1000:
-                    break
-                offset += limit
+                while True:
+                    data = await self._call_tool_with_retry("catalog_search", {"limit": limit, "offset": offset})
+                    items = data.get("items", [])
+                    if not isinstance(items, list):
+                        break
+                    enabled_batch = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
+                    all_products.extend(enabled_batch)
+                    if len(items) < limit or offset > 1000:
+                        break
+                    offset += limit
 
-            semaphore = asyncio.Semaphore(8)
+                await self._enrich_products(all_products)
 
-            async def enrich(product: dict[str, Any]) -> None:
-                product_id = int(product.get("id") or 0)
-                if product_id <= 0:
+                catalog = {
+                    "products": all_products,
+                    "total": len(all_products),
+                    "last_updated": now,
+                }
+                self.catalog_cache = catalog
+                self.cache_timestamp = now
+                return catalog
+            except Exception as exc:
+                if self.catalog_cache:
+                    logger.warning("Returning stale full catalog after MCP failure: %s", exc)
+                    return self.catalog_cache
+                raise CatalogUnavailableError("Live catalog unavailable") from exc
+
+    async def _enrich_products(self, products: list[dict[str, Any]]) -> None:
+        semaphore = asyncio.Semaphore(8)
+
+        async def enrich(product: dict[str, Any]) -> None:
+            product_id = int(product.get("id") or 0)
+            if product_id <= 0:
+                product["variants"] = []
+                return
+            async with semaphore:
+                try:
+                    product["variants"] = await self._fetch_variants_for_product(product_id)
+                except Exception as exc:
+                    logger.warning("Variant enrichment failed for %s: %s", product_id, exc)
                     product["variants"] = []
-                    return
-                async with semaphore:
-                    try:
-                        product["variants"] = await self._fetch_variants_for_product(product_id)
-                    except Exception as exc:
-                        logger.warning("Variant enrichment failed for %s: %s", product_id, exc)
-                        product["variants"] = []
 
-            await asyncio.gather(*(enrich(product) for product in all_products))
+        await asyncio.gather(*(enrich(product) for product in products))
 
-            catalog = {
-                "products": all_products,
-                "total": len(all_products),
-                "last_updated": now,
-            }
-            self.catalog_cache = catalog
-            self.cache_timestamp = now
-            return catalog
+    async def get_catalog_for_query(self, query: str, limit: int = CHAT_CATALOG_LIMIT) -> dict[str, Any]:
+        keyword = self._keyword_from_query(query)
+        cache_key = f"{keyword}:{limit}"
+        cached = self._get_search_cache(cache_key)
+        if cached:
+            return cached
+
+        async with self.search_lock:
+            cached = self._get_search_cache(cache_key)
+            if cached:
+                return cached
+
+            search_attempts = []
+            if keyword:
+                search_attempts.append({"keyword": keyword, "limit": limit, "offset": 0})
+            search_attempts.append({"limit": min(limit, 12), "offset": 0})
+
+            last_exc: Exception | None = None
+            for payload in search_attempts:
+                try:
+                    data = await self._call_tool_with_retry("catalog_search", payload)
+                    items = data.get("items", [])
+                    if not isinstance(items, list):
+                        items = []
+                    products = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
+                    await self._enrich_products(products)
+                    catalog = {
+                        "products": products,
+                        "total": len(products),
+                        "last_updated": time.time(),
+                    }
+                    self.search_cache[cache_key] = (time.time(), catalog)
+                    return catalog
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning("Search catalog attempt failed for query '%s': %s", query, exc)
+
+            if self.catalog_cache:
+                logger.warning("Falling back to cached full catalog for query '%s'", query)
+                return self.catalog_cache
+            raise CatalogUnavailableError("Search catalog unavailable") from last_exc
 
 
 mcp_client = MCPClient()
@@ -396,8 +525,13 @@ mcp_http_client: httpx.AsyncClient | None = None
 async def lifespan(_: FastAPI):
     global ollama_client, mcp_http_client
     ollama_client = httpx.AsyncClient(timeout=httpx.Timeout(OLLAMA_TIMEOUT_MS / 1000))
+    mcp_timeout = httpx.Timeout(
+        timeout=mcp_client.timeout_sec,
+        connect=min(10.0, mcp_client.timeout_sec),
+        read=mcp_client.timeout_sec,
+    )
     mcp_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(mcp_client.timeout_sec),
+        timeout=mcp_timeout,
         headers={"Accept": "application/json", "Content-Type": "application/json"},
     )
     yield
@@ -565,27 +699,41 @@ async def root() -> dict[str, str]:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    catalog = await mcp_client.get_catalog()
-    return {
-        "status": "healthy",
-        "model": OLLAMA_MODEL,
-        "mcp_url": MCP_URL,
-        "catalog_products": catalog.get("total", 0),
-    }
+    try:
+        catalog = await mcp_client.get_catalog_for_query("", limit=1)
+        return {
+            "status": "healthy",
+            "model": OLLAMA_MODEL,
+            "mcp_url": MCP_URL,
+            "catalog_products": catalog.get("total", 0),
+        }
+    except CatalogUnavailableError:
+        return {
+            "status": "degraded",
+            "model": OLLAMA_MODEL,
+            "mcp_url": MCP_URL,
+            "catalog_products": 0,
+        }
 
 
 @app.get("/catalog")
 async def get_catalog(authorization: str | None = Header(None)) -> dict[str, Any]:
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return await mcp_client.get_catalog()
+    try:
+        return await mcp_client.get_catalog()
+    except CatalogUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Catalog unavailable") from exc
 
 
 @app.post("/clear-cache")
 async def clear_cache(authorization: str | None = Header(None)) -> dict[str, str]:
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-    await mcp_client.get_catalog(force_refresh=True)
+    try:
+        await mcp_client.get_catalog(force_refresh=True)
+    except CatalogUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Catalog unavailable") from exc
     return {"status": "cache refreshed"}
 
 
@@ -594,7 +742,25 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    catalog = await mcp_client.get_catalog()
+    try:
+        catalog = await mcp_client.get_catalog_for_query(request.message)
+    except CatalogUnavailableError:
+        response = ChatResponse(
+            message=_inventory_unavailable_message(request.message),
+            model=OLLAMA_MODEL,
+            in_stock_products=0,
+            validated=False,
+            products=[],
+            cart_actions=[],
+            pending=None,
+        )
+        if request.stream:
+            async def unavailable_stream():
+                yield _sse_event({"event": "final", **response.model_dump()})
+
+            return StreamingResponse(unavailable_stream(), media_type="text/event-stream")
+        return response
+
     products = catalog.get("products", [])
     catalog_prompt = _format_catalog_for_prompt(catalog)
     messages = [
@@ -685,4 +851,3 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
 async def handle_exception(request: Request, exc: Exception):
     logger.error("Unhandled error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(status_code=500, content={"error": "Internal server error"})
-
