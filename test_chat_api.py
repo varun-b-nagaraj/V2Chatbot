@@ -90,6 +90,13 @@ def test_chat_route_returns_graceful_response_when_catalog_is_down(monkeypatch) 
 def test_chat_tools_executes_llm_requested_tool(monkeypatch) -> None:
     calls = {"count": 0}
 
+    class DummyProtocolClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
     async def fake_call_ollama_message(messages, tools=None):
         calls["count"] += 1
         if calls["count"] == 1:
@@ -114,13 +121,18 @@ def test_chat_tools_executes_llm_requested_tool(monkeypatch) -> None:
             }
         }
 
-    async def fake_tool_call(tool_name: str, payload: dict):
+    async def fake_tool_call(tool_name: str, payload: dict, **kwargs):
         assert tool_name == "catalog_search"
         assert payload["keyword"] == "chips"
         return {"items": [{"id": 1, "name": "Sea Salt Chips"}], "total": 1, "count": 1}
 
+    async def fake_get_tool_schemas(force_refresh: bool = False):
+        return [{"type": "function", "function": {"name": "catalog_search", "parameters": {"type": "object"}}}]
+
     monkeypatch.setattr(assistant_module, "call_ollama_message", fake_call_ollama_message)
     monkeypatch.setattr(assistant_module.mcp_client, "_call_tool_with_retry", fake_tool_call)
+    monkeypatch.setattr(assistant_module.mcp_client, "get_tool_schemas", fake_get_tool_schemas)
+    monkeypatch.setattr(assistant_module.mcp_client, "_new_protocol_client", lambda: DummyProtocolClient())
 
     headers = {}
     if assistant_module.API_KEY:

@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from fastmcp import Client as FastMCPClient
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -329,80 +330,6 @@ def _inventory_unavailable_message(user_text: str) -> str:
     return "I’m having trouble reaching live inventory right now. Try again in a moment and I’ll pull live options for you."
 
 
-OLLAMA_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "catalog_search",
-            "description": "Search the live product catalog by keyword, sku, category, or price range.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string", "description": "Search term for product names and catalog text."},
-                    "sku": {"type": "string", "description": "Exact SKU if known."},
-                    "categoryId": {"type": "integer", "description": "Optional category id."},
-                    "priceFrom": {"type": "number", "description": "Optional minimum price."},
-                    "priceTo": {"type": "number", "description": "Optional maximum price."},
-                    "limit": {"type": "integer", "description": "Number of products to fetch.", "default": 10},
-                    "offset": {"type": "integer", "description": "Pagination offset.", "default": 0},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "product_get",
-            "description": "Get full details for a product by product id.",
-            "parameters": {
-                "type": "object",
-                "required": ["product_id"],
-                "properties": {
-                    "product_id": {"type": "integer", "description": "The product id."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "product_variants_get",
-            "description": "Get sellable in-stock options for a product by product id.",
-            "parameters": {
-                "type": "object",
-                "required": ["product_id"],
-                "properties": {
-                    "product_id": {"type": "integer", "description": "The product id."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "store_info_get",
-            "description": "Get store hours, support, shipping, pickup, and return policy information.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "faq_search",
-            "description": "Search the store FAQ by question or topic.",
-            "parameters": {
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": {"type": "string", "description": "The shopper question or topic."},
-                    "limit": {"type": "integer", "description": "Maximum FAQ entries to return.", "default": 5},
-                },
-            },
-        },
-    },
-]
-
-
 def _format_catalog_for_prompt(catalog: dict[str, Any]) -> str:
     products = catalog.get("products", [])
     if not products:
@@ -432,11 +359,14 @@ class MCPClient:
         self.cache_timestamp = 0.0
         self.cache_ttl = CATALOG_CACHE_TTL_SEC
         self.search_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.tool_schema_cache: list[dict[str, Any]] | None = None
+        self.tool_schema_timestamp = 0.0
         self.timeout_sec = float(os.getenv("MCP_TIMEOUT_SEC", "30"))
         self.max_retries = int(os.getenv("MCP_MAX_RETRIES", "3"))
         self.retry_base_sec = float(os.getenv("MCP_RETRY_BASE_SEC", "0.4"))
         self.lock = asyncio.Lock()
         self.search_lock = asyncio.Lock()
+        self.tool_lock = asyncio.Lock()
 
     def _cache_valid(self, timestamp: float) -> bool:
         return (time.time() - timestamp) < self.cache_ttl
@@ -457,22 +387,91 @@ class MCPClient:
         filtered = [token for token in tokens if len(token) > 1 and token not in SEARCH_STOPWORDS]
         return " ".join(filtered[:6]).strip()
 
-    async def _call_tool_with_retry(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _new_protocol_client(self) -> FastMCPClient:
         if not MCP_URL:
             raise RuntimeError("MCP_URL is not configured")
-        if mcp_http_client is None:
-            raise RuntimeError("MCP client is not initialized")
+        return FastMCPClient(MCP_URL, timeout=self.timeout_sec, name="v2-chatbot")
 
+    @staticmethod
+    def _parse_protocol_tool_result(result: Any) -> dict[str, Any]:
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            return data
+        if data is not None:
+            return {"result": data}
+
+        structured = getattr(result, "structured_content", None)
+        if isinstance(structured, dict):
+            return structured
+        if structured is not None:
+            return {"result": structured}
+
+        content = getattr(result, "content", None) or []
+        text_parts: list[str] = []
+        for block in content:
+            text = getattr(block, "text", None)
+            if text:
+                text_parts.append(text)
+        if len(text_parts) == 1:
+            try:
+                parsed = json.loads(text_parts[0])
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+            if parsed is not None:
+                return {"result": parsed}
+        if text_parts:
+            return {"content": text_parts}
+        return {}
+
+    @staticmethod
+    def _tool_to_ollama_schema(tool: Any) -> dict[str, Any]:
+        parameters = getattr(tool, "inputSchema", None)
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            parameters = {"type": "object", "properties": {}}
+        return {
+            "type": "function",
+            "function": {
+                "name": getattr(tool, "name", ""),
+                "description": getattr(tool, "description", "") or "",
+                "parameters": parameters,
+            },
+        }
+
+    async def get_tool_schemas(self, force_refresh: bool = False) -> list[dict[str, Any]]:
+        if not force_refresh and self.tool_schema_cache and self._cache_valid(self.tool_schema_timestamp):
+            return self.tool_schema_cache
+
+        async with self.tool_lock:
+            if not force_refresh and self.tool_schema_cache and self._cache_valid(self.tool_schema_timestamp):
+                return self.tool_schema_cache
+
+            async with self._new_protocol_client() as client:
+                tools = await client.list_tools()
+            schemas = [self._tool_to_ollama_schema(tool) for tool in tools if getattr(tool, "name", None)]
+            self.tool_schema_cache = schemas
+            self.tool_schema_timestamp = time.time()
+            return schemas
+
+    async def _call_tool_with_retry(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        *,
+        client: FastMCPClient | None = None,
+    ) -> dict[str, Any]:
         last_error: Exception | None = None
-        url = f"{MCP_URL.rstrip('/')}/tools/{tool_name}"
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await mcp_http_client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if isinstance(data, dict):
-                    return data
-                raise RuntimeError(f"Unexpected {tool_name} payload")
+                if client is not None:
+                    result = await client.call_tool(tool_name, payload or {}, raise_on_error=True)
+                else:
+                    async with self._new_protocol_client() as fresh_client:
+                        result = await fresh_client.call_tool(tool_name, payload or {}, raise_on_error=True)
+                if getattr(result, "is_error", False):
+                    raise RuntimeError(f"MCP tool returned error: {tool_name}")
+                return self._parse_protocol_tool_result(result)
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -488,8 +487,13 @@ class MCPClient:
                     await asyncio.sleep(delay)
         raise RuntimeError(f"MCP {tool_name} failed") from last_error
 
-    async def _fetch_variants_for_product(self, product_id: int) -> list[dict[str, Any]]:
-        data = await self._call_tool_with_retry("product_variants_get", {"product_id": product_id})
+    async def _fetch_variants_for_product(
+        self,
+        product_id: int,
+        *,
+        client: FastMCPClient | None = None,
+    ) -> list[dict[str, Any]]:
+        data = await self._call_tool_with_retry("product_variants_get", {"product_id": product_id}, client=client)
         variants = data.get("variants", [])
         if not isinstance(variants, list):
             return []
@@ -528,22 +532,23 @@ class MCPClient:
                 return self.catalog_cache
 
             try:
-                all_products: list[dict[str, Any]] = []
-                offset = 0
-                limit = 100
+                async with self._new_protocol_client() as client:
+                    all_products: list[dict[str, Any]] = []
+                    offset = 0
+                    limit = 100
 
-                while True:
-                    data = await self._call_tool_with_retry("catalog_search", {"limit": limit, "offset": offset})
-                    items = data.get("items", [])
-                    if not isinstance(items, list):
-                        break
-                    enabled_batch = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
-                    all_products.extend(enabled_batch)
-                    if len(items) < limit or offset > 1000:
-                        break
-                    offset += limit
+                    while True:
+                        data = await self._call_tool_with_retry("catalog_search", {"limit": limit, "offset": offset}, client=client)
+                        items = data.get("items", [])
+                        if not isinstance(items, list):
+                            break
+                        enabled_batch = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
+                        all_products.extend(enabled_batch)
+                        if len(items) < limit or offset > 1000:
+                            break
+                        offset += limit
 
-                await self._enrich_products(all_products)
+                    await self._enrich_products(all_products, client=client)
 
                 catalog = {
                     "products": all_products,
@@ -559,7 +564,12 @@ class MCPClient:
                     return self.catalog_cache
                 raise CatalogUnavailableError("Live catalog unavailable") from exc
 
-    async def _enrich_products(self, products: list[dict[str, Any]]) -> None:
+    async def _enrich_products(
+        self,
+        products: list[dict[str, Any]],
+        *,
+        client: FastMCPClient | None = None,
+    ) -> None:
         semaphore = asyncio.Semaphore(8)
 
         async def enrich(product: dict[str, Any]) -> None:
@@ -569,7 +579,7 @@ class MCPClient:
                 return
             async with semaphore:
                 try:
-                    product["variants"] = await self._fetch_variants_for_product(product_id)
+                    product["variants"] = await self._fetch_variants_for_product(product_id, client=client)
                 except Exception as exc:
                     logger.warning("Variant enrichment failed for %s: %s", product_id, exc)
                     product["variants"] = []
@@ -594,24 +604,25 @@ class MCPClient:
             search_attempts.append({"limit": min(limit, 12), "offset": 0})
 
             last_exc: Exception | None = None
-            for payload in search_attempts:
-                try:
-                    data = await self._call_tool_with_retry("catalog_search", payload)
-                    items = data.get("items", [])
-                    if not isinstance(items, list):
-                        items = []
-                    products = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
-                    await self._enrich_products(products)
-                    catalog = {
-                        "products": products,
-                        "total": len(products),
-                        "last_updated": time.time(),
-                    }
-                    self.search_cache[cache_key] = (time.time(), catalog)
-                    return catalog
-                except Exception as exc:
-                    last_exc = exc
-                    logger.warning("Search catalog attempt failed for query '%s': %s", query, exc)
+            async with self._new_protocol_client() as client:
+                for payload in search_attempts:
+                    try:
+                        data = await self._call_tool_with_retry("catalog_search", payload, client=client)
+                        items = data.get("items", [])
+                        if not isinstance(items, list):
+                            items = []
+                        products = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
+                        await self._enrich_products(products, client=client)
+                        catalog = {
+                            "products": products,
+                            "total": len(products),
+                            "last_updated": time.time(),
+                        }
+                        self.search_cache[cache_key] = (time.time(), catalog)
+                        return catalog
+                    except Exception as exc:
+                        last_exc = exc
+                        logger.warning("Search catalog attempt failed for query '%s': %s", query, exc)
 
             if self.catalog_cache:
                 logger.warning("Falling back to cached full catalog for query '%s'", query)
@@ -621,27 +632,15 @@ class MCPClient:
 
 mcp_client = MCPClient()
 ollama_client: httpx.AsyncClient | None = None
-mcp_http_client: httpx.AsyncClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global ollama_client, mcp_http_client
+    global ollama_client
     ollama_client = httpx.AsyncClient(timeout=httpx.Timeout(OLLAMA_TIMEOUT_MS / 1000))
-    mcp_timeout = httpx.Timeout(
-        timeout=mcp_client.timeout_sec,
-        connect=min(10.0, mcp_client.timeout_sec),
-        read=mcp_client.timeout_sec,
-    )
-    mcp_http_client = httpx.AsyncClient(
-        timeout=mcp_timeout,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-    )
     yield
     if ollama_client is not None:
         await ollama_client.aclose()
-    if mcp_http_client is not None:
-        await mcp_http_client.aclose()
 
 
 app = FastAPI(
@@ -825,51 +824,53 @@ async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
 
     traces: list[ToolCallTrace] = []
     max_rounds = 4
+    tool_schemas = await mcp_client.get_tool_schemas()
 
-    for round_num in range(1, max_rounds + 1):
-        response = await call_ollama_message(messages, tools=OLLAMA_TOOL_SCHEMAS)
-        message = response.get("message", {})
-        if not isinstance(message, dict):
-            return ToolChatResponse(message="", model=OLLAMA_MODEL, tool_calls=traces, rounds=round_num)
+    async with mcp_client._new_protocol_client() as protocol_client:
+        for round_num in range(1, max_rounds + 1):
+            response = await call_ollama_message(messages, tools=tool_schemas)
+            message = response.get("message", {})
+            if not isinstance(message, dict):
+                return ToolChatResponse(message="", model=OLLAMA_MODEL, tool_calls=traces, rounds=round_num)
 
-        tool_calls = message.get("tool_calls") or []
-        if not isinstance(tool_calls, list) or not tool_calls:
-            return ToolChatResponse(
-                message=message.get("content", "") or "",
-                model=OLLAMA_MODEL,
-                tool_calls=traces,
-                rounds=round_num,
-            )
-
-        messages.append(message)
-        for tool_call in tool_calls:
-            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-            name = function.get("name")
-            arguments = _normalize_tool_arguments(function.get("arguments"))
-            if not name:
-                continue
-
-            try:
-                result = await mcp_client._call_tool_with_retry(name, arguments)
-                trace = ToolCallTrace(name=name, arguments=arguments, ok=True, result=result)
-                tool_payload = result
-            except Exception as exc:
-                trace = ToolCallTrace(
-                    name=name,
-                    arguments=arguments,
-                    ok=False,
-                    result={},
-                    error=str(exc),
+            tool_calls = message.get("tool_calls") or []
+            if not isinstance(tool_calls, list) or not tool_calls:
+                return ToolChatResponse(
+                    message=message.get("content", "") or "",
+                    model=OLLAMA_MODEL,
+                    tool_calls=traces,
+                    rounds=round_num,
                 )
-                tool_payload = {"error": str(exc)}
-            traces.append(trace)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_name": name,
-                    "content": json.dumps(tool_payload, ensure_ascii=True),
-                }
-            )
+
+            messages.append(message)
+            for tool_call in tool_calls:
+                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                name = function.get("name")
+                arguments = _normalize_tool_arguments(function.get("arguments"))
+                if not name:
+                    continue
+
+                try:
+                    result = await mcp_client._call_tool_with_retry(name, arguments, client=protocol_client)
+                    trace = ToolCallTrace(name=name, arguments=arguments, ok=True, result=result)
+                    tool_payload = result
+                except Exception as exc:
+                    trace = ToolCallTrace(
+                        name=name,
+                        arguments=arguments,
+                        ok=False,
+                        result={},
+                        error=str(exc),
+                    )
+                    tool_payload = {"error": str(exc)}
+                traces.append(trace)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": name,
+                        "content": json.dumps(tool_payload, ensure_ascii=True),
+                    }
+                )
 
     final_response = await call_ollama_message(messages)
     final_message = final_response.get("message", {}) if isinstance(final_response, dict) else {}
