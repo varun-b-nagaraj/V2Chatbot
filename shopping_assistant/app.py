@@ -62,6 +62,20 @@ Style:
 - Helpful salesperson, not hype.
 """
 
+TOOL_SYSTEM_PROMPT = """
+You are a store assistant with live tools.
+
+Rules:
+- Use tools whenever the user asks for product, stock, options, policies, or store info.
+- Never invent product data.
+- Prefer `catalog_search` first for shopping requests.
+- Use `product_get` for a specific product.
+- Use `product_variants_get` when the user needs options, sizes, or flavors.
+- Use `store_info_get` and `faq_search` for policies and store operations.
+- After you receive tool results, answer clearly and briefly.
+- If a tool fails, explain that live inventory is temporarily unavailable instead of making anything up.
+"""
+
 SELECTION_SYSTEM_PROMPT = """
 Return only valid JSON in the shape {"indexes":[0,1]}.
 Use 0-based indexes.
@@ -169,6 +183,21 @@ class ChatResponse(BaseModel):
     products: list[ProductLink] = Field(default_factory=list)
     cart_actions: list[CartAction] = Field(default_factory=list)
     pending: PendingChoice | None = None
+
+
+class ToolCallTrace(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    ok: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+
+class ToolChatResponse(BaseModel):
+    message: str
+    model: str
+    tool_calls: list[ToolCallTrace] = Field(default_factory=list)
+    rounds: int
 
 
 def _normalize_ollama_base_url(raw_url: str) -> str:
@@ -298,6 +327,80 @@ def _inventory_unavailable_message(user_text: str) -> str:
     if _should_add_to_cart(user_text):
         return "I’m having trouble reaching live inventory right now, so I can’t safely add that yet. Try again in a moment."
     return "I’m having trouble reaching live inventory right now. Try again in a moment and I’ll pull live options for you."
+
+
+OLLAMA_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "catalog_search",
+            "description": "Search the live product catalog by keyword, sku, category, or price range.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "Search term for product names and catalog text."},
+                    "sku": {"type": "string", "description": "Exact SKU if known."},
+                    "categoryId": {"type": "integer", "description": "Optional category id."},
+                    "priceFrom": {"type": "number", "description": "Optional minimum price."},
+                    "priceTo": {"type": "number", "description": "Optional maximum price."},
+                    "limit": {"type": "integer", "description": "Number of products to fetch.", "default": 10},
+                    "offset": {"type": "integer", "description": "Pagination offset.", "default": 0},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "product_get",
+            "description": "Get full details for a product by product id.",
+            "parameters": {
+                "type": "object",
+                "required": ["product_id"],
+                "properties": {
+                    "product_id": {"type": "integer", "description": "The product id."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "product_variants_get",
+            "description": "Get sellable in-stock options for a product by product id.",
+            "parameters": {
+                "type": "object",
+                "required": ["product_id"],
+                "properties": {
+                    "product_id": {"type": "integer", "description": "The product id."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "store_info_get",
+            "description": "Get store hours, support, shipping, pickup, and return policy information.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "faq_search",
+            "description": "Search the store FAQ by question or topic.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "description": "The shopper question or topic."},
+                    "limit": {"type": "integer", "description": "Maximum FAQ entries to return.", "default": 5},
+                },
+            },
+        },
+    },
+]
 
 
 def _format_catalog_for_prompt(catalog: dict[str, Any]) -> str:
@@ -567,6 +670,14 @@ else:
 
 
 async def call_ollama(messages: list[dict[str, str]]) -> str:
+    response = await call_ollama_message(messages)
+    return response.get("message", {}).get("content", "")
+
+
+async def call_ollama_message(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if ollama_client is None:
         raise HTTPException(status_code=503, detail="LLM client not initialized")
 
@@ -576,6 +687,8 @@ async def call_ollama(messages: list[dict[str, str]]) -> str:
         "stream": False,
         "options": {"temperature": MODEL_TEMPERATURE},
     }
+    if tools:
+        payload["tools"] = tools
     headers: dict[str, str] = {}
     if OLLAMA_API_KEY:
         headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
@@ -584,7 +697,7 @@ async def call_ollama(messages: list[dict[str, str]]) -> str:
         response = await ollama_client.post(_ollama_chat_url(), json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        return data.get("message", {}).get("content", "")
+        return data if isinstance(data, dict) else {}
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Ollama timed out") from exc
     except httpx.HTTPStatusError as exc:
@@ -690,6 +803,82 @@ def _build_pending_choice(request_text: str, product_links: list[ProductLink]) -
 
 def _sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _normalize_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str):
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}]
+    for item in request.history or []:
+        messages.append({"role": item.role, "content": item.content})
+    messages.append({"role": "user", "content": request.message})
+
+    traces: list[ToolCallTrace] = []
+    max_rounds = 4
+
+    for round_num in range(1, max_rounds + 1):
+        response = await call_ollama_message(messages, tools=OLLAMA_TOOL_SCHEMAS)
+        message = response.get("message", {})
+        if not isinstance(message, dict):
+            return ToolChatResponse(message="", model=OLLAMA_MODEL, tool_calls=traces, rounds=round_num)
+
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return ToolChatResponse(
+                message=message.get("content", "") or "",
+                model=OLLAMA_MODEL,
+                tool_calls=traces,
+                rounds=round_num,
+            )
+
+        messages.append(message)
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            name = function.get("name")
+            arguments = _normalize_tool_arguments(function.get("arguments"))
+            if not name:
+                continue
+
+            try:
+                result = await mcp_client._call_tool_with_retry(name, arguments)
+                trace = ToolCallTrace(name=name, arguments=arguments, ok=True, result=result)
+                tool_payload = result
+            except Exception as exc:
+                trace = ToolCallTrace(
+                    name=name,
+                    arguments=arguments,
+                    ok=False,
+                    result={},
+                    error=str(exc),
+                )
+                tool_payload = {"error": str(exc)}
+            traces.append(trace)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_name": name,
+                    "content": json.dumps(tool_payload, ensure_ascii=True),
+                }
+            )
+
+    final_response = await call_ollama_message(messages)
+    final_message = final_response.get("message", {}) if isinstance(final_response, dict) else {}
+    return ToolChatResponse(
+        message=final_message.get("content", "") if isinstance(final_message, dict) else "",
+        model=OLLAMA_MODEL,
+        tool_calls=traces,
+        rounds=max_rounds,
+    )
 
 
 @app.get("/")
@@ -845,6 +1034,13 @@ async def chat(request: ChatRequest, authorization: str | None = Header(None)):
 
     raw_text = await call_ollama(messages)
     return await finalize_response(raw_text)
+
+
+@app.post("/chat-tools", response_model=ToolChatResponse)
+async def chat_tools(request: ChatRequest, authorization: str | None = Header(None)):
+    if API_KEY and authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return await _run_llm_tool_chat(request)
 
 
 @app.exception_handler(Exception)
