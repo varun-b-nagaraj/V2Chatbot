@@ -201,6 +201,30 @@ def test_chat_route_returns_graceful_response_when_catalog_is_down(monkeypatch) 
     assert body["products"] == []
 
 
+def test_chat_route_handles_mcp_session_open_failure(monkeypatch) -> None:
+    class BrokenProtocolClient:
+        async def __aenter__(self):
+            raise RuntimeError("session open failed")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(assistant_module.mcp_client, "_new_protocol_client", lambda: BrokenProtocolClient())
+
+    headers = {}
+    if assistant_module.API_KEY:
+        headers["Authorization"] = f"Bearer {assistant_module.API_KEY}"
+
+    response = client.post(
+        "/chat",
+        json={"message": "show me chips"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["validated"] is False
+
+
 def test_chat_tools_executes_llm_requested_tool(monkeypatch) -> None:
     calls = {"count": 0}
 

@@ -19,6 +19,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from e_series_mcp.server import mcp as local_mcp_server
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 PORT = int(os.getenv("PORT", "8000"))
 MCP_URL = os.getenv("MCP_URL", "").strip()
+USE_LOCAL_MCP = os.getenv("USE_LOCAL_MCP", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud").strip()
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
@@ -405,8 +408,10 @@ class MCPClient:
         return " ".join(filtered[:6]).strip()
 
     def _new_protocol_client(self) -> FastMCPClient:
+        if USE_LOCAL_MCP:
+            return FastMCPClient(local_mcp_server, timeout=self.timeout_sec, name="v2-chatbot")
         if not MCP_URL:
-            raise RuntimeError("MCP_URL is not configured")
+            raise RuntimeError("MCP_URL is not configured and USE_LOCAL_MCP is disabled")
         return FastMCPClient(MCP_URL, timeout=self.timeout_sec, name="v2-chatbot")
 
     @staticmethod
@@ -464,8 +469,11 @@ class MCPClient:
             if not force_refresh and self.tool_schema_cache and self._cache_valid(self.tool_schema_timestamp):
                 return self.tool_schema_cache
 
-            async with self._new_protocol_client() as client:
-                tools = await client.list_tools()
+            try:
+                async with self._new_protocol_client() as client:
+                    tools = await client.list_tools()
+            except Exception as exc:
+                raise CatalogUnavailableError("Tool schema discovery unavailable") from exc
             schemas = [self._tool_to_ollama_schema(tool) for tool in tools if getattr(tool, "name", None)]
             self.tool_schema_cache = schemas
             self.tool_schema_timestamp = time.time()
@@ -621,25 +629,29 @@ class MCPClient:
             search_attempts.append({"limit": min(limit, 12), "offset": 0})
 
             last_exc: Exception | None = None
-            async with self._new_protocol_client() as client:
-                for payload in search_attempts:
-                    try:
-                        data = await self._call_tool_with_retry("catalog_search", payload, client=client)
-                        items = data.get("items", [])
-                        if not isinstance(items, list):
-                            items = []
-                        products = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
-                        await self._enrich_products(products, client=client)
-                        catalog = {
-                            "products": products,
-                            "total": len(products),
-                            "last_updated": time.time(),
-                        }
-                        self.search_cache[cache_key] = (time.time(), catalog)
-                        return catalog
-                    except Exception as exc:
-                        last_exc = exc
-                        logger.warning("Search catalog attempt failed for query '%s': %s", query, exc)
+            try:
+                async with self._new_protocol_client() as client:
+                    for payload in search_attempts:
+                        try:
+                            data = await self._call_tool_with_retry("catalog_search", payload, client=client)
+                            items = data.get("items", [])
+                            if not isinstance(items, list):
+                                items = []
+                            products = [item for item in items if isinstance(item, dict) and item.get("enabled", False)]
+                            await self._enrich_products(products, client=client)
+                            catalog = {
+                                "products": products,
+                                "total": len(products),
+                                "last_updated": time.time(),
+                            }
+                            self.search_cache[cache_key] = (time.time(), catalog)
+                            return catalog
+                        except Exception as exc:
+                            last_exc = exc
+                            logger.warning("Search catalog attempt failed for query '%s': %s", query, exc)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Failed to open MCP session for query '%s': %s", query, exc)
 
             if self.catalog_cache:
                 logger.warning("Falling back to cached full catalog for query '%s'", query)
@@ -938,14 +950,16 @@ async def health() -> dict[str, Any]:
         return {
             "status": "healthy",
             "model": OLLAMA_MODEL,
-            "mcp_url": MCP_URL,
+            "mcp_mode": "local" if USE_LOCAL_MCP else "remote",
+            "mcp_url": None if USE_LOCAL_MCP else MCP_URL,
             "catalog_products": catalog.get("total", 0),
         }
     except CatalogUnavailableError:
         return {
             "status": "degraded",
             "model": OLLAMA_MODEL,
-            "mcp_url": MCP_URL,
+            "mcp_mode": "local" if USE_LOCAL_MCP else "remote",
+            "mcp_url": None if USE_LOCAL_MCP else MCP_URL,
             "catalog_products": 0,
         }
 
