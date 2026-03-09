@@ -82,6 +82,26 @@ Rules:
 - Keep responses short and specific.
 """
 
+TOOL_LOOP_PROMPT = """
+You are operating in an agent loop with live store tools.
+
+You must respond with JSON only, no markdown.
+
+Valid shapes:
+{"action":"tool","name":"catalog_search","arguments":{"keyword":"chips","limit":8}}
+{"action":"answer","message":"Here are a few chip options..."}
+
+Rules:
+- Pick exactly one action each turn.
+- Use tools whenever product, stock, options, FAQ, or store-info facts are needed.
+- Do not invent product data.
+- Use one tool at a time.
+- After tool results are provided, either call another tool or answer.
+- If you answer with specific sellable options, include [V:productId:combinationId] tags.
+- Use only IDs and facts present in tool results.
+- Keep answers concise.
+"""
+
 SELECTION_SYSTEM_PROMPT = """
 Return only valid JSON in the shape {"indexes":[0,1]}.
 Use 0-based indexes.
@@ -876,6 +896,38 @@ def _normalize_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {}
 
 
+def _format_tool_schemas_for_prompt(tool_schemas: list[dict[str, Any]]) -> str:
+    compact: list[dict[str, Any]] = []
+    for tool in tool_schemas:
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        compact.append(
+            {
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {}),
+            }
+        )
+    return json.dumps(compact, ensure_ascii=True)
+
+
+def _parse_tool_decision(text: str) -> dict[str, Any]:
+    parsed = _extract_json_object(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Model did not return valid JSON tool decision")
+    action = parsed.get("action")
+    if action not in {"tool", "answer"}:
+        raise RuntimeError("Model returned invalid action")
+    if action == "tool":
+        name = parsed.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError("Model returned tool action without name")
+        parsed["arguments"] = _normalize_tool_arguments(parsed.get("arguments"))
+    else:
+        if not isinstance(parsed.get("message"), str):
+            raise RuntimeError("Model returned answer action without message")
+    return parsed
+
+
 def _catalog_from_tool_traces(traces: list[ToolCallTrace]) -> dict[str, Any]:
     product_index: dict[int, dict[str, Any]] = {}
 
@@ -941,63 +993,80 @@ def _catalog_from_tool_traces(traces: list[ToolCallTrace]) -> dict[str, Any]:
 async def _run_llm_tool_roundtrip(
     request: ChatRequest,
 ) -> tuple[str, list[ToolCallTrace], dict[str, Any]]:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}]
+    tool_schemas = await mcp_client.get_tool_schemas()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": TOOL_SYSTEM_PROMPT},
+        {"role": "system", "content": TOOL_LOOP_PROMPT},
+        {"role": "system", "content": f"AVAILABLE_TOOLS: {_format_tool_schemas_for_prompt(tool_schemas)}"},
+    ]
     for item in request.history or []:
         messages.append({"role": item.role, "content": item.content})
     messages.append({"role": "user", "content": request.message})
 
     traces: list[ToolCallTrace] = []
     max_rounds = 4
-    tool_schemas = await mcp_client.get_tool_schemas()
 
     async with mcp_client._new_protocol_client() as protocol_client:
         for round_num in range(1, max_rounds + 1):
-            response = await call_ollama_message(messages, tools=tool_schemas)
+            response = await call_ollama_message(messages)
             message = response.get("message", {})
             if not isinstance(message, dict):
                 return "", traces, _catalog_from_tool_traces(traces)
+            content = message.get("content", "") or ""
+            decision = _parse_tool_decision(content)
 
-            tool_calls = message.get("tool_calls") or []
-            if not isinstance(tool_calls, list) or not tool_calls:
-                return message.get("content", "") or "", traces, _catalog_from_tool_traces(traces)
+            if decision["action"] == "answer":
+                return decision["message"], traces, _catalog_from_tool_traces(traces)
 
-            messages.append(message)
-            for tool_call in tool_calls:
-                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-                name = function.get("name")
-                arguments = _normalize_tool_arguments(function.get("arguments"))
-                if not name:
-                    continue
-
-                try:
-                    result = await mcp_client._call_tool_with_retry(name, arguments, client=protocol_client)
-                    trace = ToolCallTrace(name=name, arguments=arguments, ok=True, result=result)
-                    tool_payload = result
-                except Exception as exc:
-                    trace = ToolCallTrace(
-                        name=name,
-                        arguments=arguments,
-                        ok=False,
-                        result={},
-                        error=str(exc),
-                    )
-                    tool_payload = {"error": str(exc)}
-                traces.append(trace)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": name,
-                        "content": json.dumps(tool_payload, ensure_ascii=True),
-                    }
+            name = decision["name"]
+            arguments = decision["arguments"]
+            messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=True)})
+            try:
+                result = await mcp_client._call_tool_with_retry(name, arguments, client=protocol_client)
+                trace = ToolCallTrace(name=name, arguments=arguments, ok=True, result=result)
+                tool_payload = result
+            except Exception as exc:
+                trace = ToolCallTrace(
+                    name=name,
+                    arguments=arguments,
+                    ok=False,
+                    result={},
+                    error=str(exc),
                 )
+                tool_payload = {"error": str(exc)}
+            traces.append(trace)
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        {
+                            "tool_name": name,
+                            "arguments": arguments,
+                            "result": tool_payload,
+                        },
+                        ensure_ascii=True,
+                    ),
+                }
+            )
 
-    final_response = await call_ollama_message(messages)
-    final_message = final_response.get("message", {}) if isinstance(final_response, dict) else {}
-    return (
-        final_message.get("content", "") if isinstance(final_message, dict) else "",
-        traces,
-        _catalog_from_tool_traces(traces),
+    final_response = await call_ollama_message(
+        messages
+        + [
+            {
+                "role": "user",
+                "content": 'Respond now with JSON only: {"action":"answer","message":"..."}',
+            }
+        ]
     )
+    final_message = final_response.get("message", {}) if isinstance(final_response, dict) else {}
+    final_content = final_message.get("content", "") if isinstance(final_message, dict) else ""
+    try:
+        final_decision = _parse_tool_decision(final_content)
+        if final_decision["action"] == "answer":
+            return final_decision["message"], traces, _catalog_from_tool_traces(traces)
+    except Exception:
+        pass
+    return final_content, traces, _catalog_from_tool_traces(traces)
 
 
 async def _run_llm_tool_chat(request: ChatRequest) -> ToolChatResponse:

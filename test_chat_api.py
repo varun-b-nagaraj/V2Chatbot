@@ -209,51 +209,19 @@ def test_chat_route_handles_mcp_session_open_failure(monkeypatch) -> None:
 
 
 def test_chat_tools_executes_llm_requested_tool(monkeypatch) -> None:
-    calls = {"count": 0}
+    traces = [
+        assistant_module.ToolCallTrace(
+            name="catalog_search",
+            arguments={"keyword": "chips", "limit": 3},
+            ok=True,
+            result={"items": [{"id": 1, "name": "Sea Salt Chips"}], "total": 1, "count": 1},
+        )
+    ]
 
-    class DummyProtocolClient:
-        async def __aenter__(self):
-            return self
+    async def fake_roundtrip(request):
+        return "Here are a few good chip options right now.", traces, {"products": [], "total": 0}
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-    async def fake_call_ollama_message(messages, tools=None):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return {
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "catalog_search",
-                                "arguments": {"keyword": "chips", "limit": 3},
-                            }
-                        }
-                    ],
-                }
-            }
-        return {
-            "message": {
-                "role": "assistant",
-                "content": "Here are a few good chip options right now.",
-            }
-        }
-
-    async def fake_tool_call(tool_name: str, payload: dict, **kwargs):
-        assert tool_name == "catalog_search"
-        assert payload["keyword"] == "chips"
-        return {"items": [{"id": 1, "name": "Sea Salt Chips"}], "total": 1, "count": 1}
-
-    async def fake_get_tool_schemas(force_refresh: bool = False):
-        return [{"type": "function", "function": {"name": "catalog_search", "parameters": {"type": "object"}}}]
-
-    monkeypatch.setattr(assistant_module, "call_ollama_message", fake_call_ollama_message)
-    monkeypatch.setattr(assistant_module.mcp_client, "_call_tool_with_retry", fake_tool_call)
-    monkeypatch.setattr(assistant_module.mcp_client, "get_tool_schemas", fake_get_tool_schemas)
-    monkeypatch.setattr(assistant_module.mcp_client, "_new_protocol_client", lambda: DummyProtocolClient())
+    monkeypatch.setattr(assistant_module, "_run_llm_tool_roundtrip", fake_roundtrip)
 
     headers = {}
     if assistant_module.API_KEY:
